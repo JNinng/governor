@@ -437,3 +437,7 @@ Prometheus / OTel 等适配器以 [observ](https://github.com/jninng/observ)
 - [docs/strategies.md](docs/strategies.md) — 策略与参数手册（各策略公式、参数约束、指标与日志）
 - [docs/desc.md](docs/desc.md) — 算法理论设计
 - [docs/adr/](docs/adr/) — 架构决策记录
+
+## 许可证
+
+[MIT](LICENSE) © JNinng

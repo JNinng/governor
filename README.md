@@ -29,9 +29,21 @@ governor.Do(ctx, g, op)
      α = clamp(S/(S+C), 0, 1)：S 越大丢得越狠，探测放行保证反馈永不归零
 ```
 
+### 示例一览
+
+四个可运行示例，从最小闭环到真实业务形态：
+
+| 示例 | 演示重点 | 运行 |
+|---|---|---|
+| [minimal](example/minimal/main.go) | 最小闭环：一个延迟信号 + `Do` + 降级分支 | `go run ./example/minimal` |
+| [bff](example/bff/main.go) | 业务场景：晚高峰劣化 → 本地缓存兜底 | `go run ./example/bff` |
+| [http](example/http/main.go) | 真实 `http.Client` 调用 + observ 日志与降级统计 | `go run ./example/http` |
+| [wait](example/wait/main.go) | 策略三延迟执行：等待随压力阶梯升降，零丢弃 | `go run ./example/wait` |
+
 ### 复制即跑的最小示例
 
-模拟一个第 6 次请求起开始过载的下游（响应 300ms），完整程序见
+上面三句话模型的最短实现——感知、流控器、降级分支各占几行。
+模拟下游第 6 次请求起过载（响应 300ms，目标 100ms），完整程序见
 [example/minimal/main.go](example/minimal/main.go)，`go run ./example/minimal` 直接运行：
 
 ```go
@@ -106,14 +118,36 @@ func main() {
 - **过载即收敛**：无需配置任何阈值，α 跟随反馈爬升到与过载程度匹配的位置；
 - **降级在你的代码里**：`ErrSuppressed` 分支返回兜底值——库只管快速失败。
 
+### 业务场景示例：晚高峰的用户服务调用
+
+`go run ./example/bff`（[example/bff/main.go](example/bff/main.go)）——
+商品页 BFF 调用户服务取昵称：平时响应 80ms，晚高峰劣化到 500ms（目标 100ms）；
+被抑制的请求**不发出**，回本地缓存兜底（概率丢弃，每次运行略有差异）：
+
+```text
+请求  1  远端OK  用户服务实时昵称   α=0.00   ← 平峰：α=0，接近透传
+请求  6  远端OK  用户服务实时昵称   α=0.70   ← 晚高峰首个 500ms 采样，压力抬升
+请求  7  远端OK  用户服务实时昵称   α=0.77
+请求  8  降级→本地缓存昵称   α=0.77   ← 概率丢弃开始命中：请求没发出去
+请求  9  远端OK  用户服务实时昵称   α=0.79
+请求 12  降级→本地缓存昵称   α=0.79   ← 稳定趋向 0.8（500ms = 5×目标 → S=4 → α=4/5）
+```
+
+*（中间行省略；完整 12 行见实际运行。）*
+
+对照真实业务：**远端接口变慢而非报错**时（P99 劣化、队列堆积），延迟信号先于
+错误发生作用；α 收敛到的位置由过载程度（几倍于目标）决定，无需人工设阈值。
+
 ### 真实 HTTP 一键演示
+
+换成真实网络栈跑同一套闭环：内置一个响应 250ms 的本地"过载服务"（目标 100ms），
+`governor.Do` 包住 `http.Client` 调用。示例同时演示 observ 接入姿势——
+slog 以 Info 阈值接入（只出状态跃迁日志），结束时汇总放行/降级统计
+（[example/http/main.go](example/http/main.go)）：
 
 ```bash
 go run ./example/http
 ```
-
-内置一个响应 250ms 的本地"过载服务"（目标 100ms），演示 `http.Client` 场景、
-observ 日志（slog 以 Info 阈值接入）与降级统计（[example/http/main.go](example/http/main.go)）：
 
 ```text
 time=2026-08-15T23:48:52.437+08:00 level=WARN msg="governor: suppression started (alpha went above 0.5)" pressure=1.520119 suppression=0.6031933412668211
@@ -175,11 +209,11 @@ for {
 ```
 
 完整可运行示例：`go run ./example/wait`（[example/wait/main.go](example/wait/main.go)）。
-模拟下游三档梯度（600ms 轻度过载 → 1100ms 加深 → 200ms 恢复，目标 500ms），
-实测输出——等待随压力**阶梯式上升**，恢复后一两次采样即归零，
-**12 次执行无一被丢弃**；示例以 Info 阈值接入 slog，只记状态跃迁
-（`WARN suppression started` / `INFO suppression stopped`），DEBUG 级
-`wait changed`（带 from→to 明细）静默，需要排查时调到 Debug 即见：
+场景是后台同步任务：下游三档梯度变化（600ms 轻度过载 → 1100ms 加深 → 200ms 恢复，
+目标 500ms）。两个看点：**等待随压力阶梯式上升，恢复后一两次采样即归零；
+全程 12 次执行无一被丢弃**——延迟执行只延后、不丢请求。日志同 http 示例，
+以 Info 阈值接入只记状态跃迁（`WARN suppression started` / `INFO suppression
+stopped`），DEBUG 级 `wait changed`（带 from→to 明细）静默，排查时调到 Debug 即见：
 
 ```text
 第  4 次  等待  334ms │ 执行 1100ms │ α=0.44
@@ -193,6 +227,34 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 第 11 次  等待    0ms │ 执行  200ms │ α=0.00   ← 归零，全速运行
 ```
 
+## 信号与参数选型速查
+
+动作怎么选看上表（按业务能否容忍丢失 / 减量 / 延迟）；感知什么、参数怎么调看这里。
+
+**选哪个信号（感知什么反馈）：**
+
+| 信号 | 过载怎么看出来 | 适用场景 | 关键参数（默认） |
+|---|---|---|---|
+| `RejectionSignal`（场景 A） | 滑窗失败率超 1/K | 下游**显式拒绝**：HTTP 429/503、RPC 错误 | `WithRejectionK` 2.0（容忍 50% 失败）、`WithRejectionWindow` 90s |
+| `LatencySignal`（场景 B） | EWMA 耗时超目标值 | 下游**变慢但不报错**：P99 劣化、写入堆积 | `WithLatencyTarget` 200ms、`WithLatencyBeta` 0.4、`WithLatencyWindow` 90s |
+| 两者组合 | 取最差值，任一维度过载即抑制 | 错误与变慢互为前兆（推荐默认） | — |
+| 自定义 `Signal` | 任意口径（队列深度、在途请求数…） | 内置两类的口径都不合适 | 实现 `Name/Observe/Pressure` 三方法 |
+
+**参数往哪调：**
+
+| 参数 | 默认 | 调大 | 调小 |
+|---|---|---|---|
+| `WithSensitivity`（C） | 1.0 | 抑制更保守（S=C 才丢一半） | 更激进（小压力即强抑制） |
+| `WithProbeRatio` | 0.02 | 深度抑制期反馈更足，穿透流量更多 | 反馈变稀；0=关闭探测（可逼近全丢） |
+| `WithLatencyTarget` | 200ms | 对变慢更宽容 | 更早感知劣化 |
+| `WithRejectionK` | 2.0 | 容忍更高失败率 | 更早感知失败 |
+| `WithBatch`（max/min） | 100/1 | 过载时单批冲击更大、吞吐更高 | 反馈更细、对下游更温和 |
+| `WithBaseWait` | 1s | 深度抑制时等待上限更高 | 延迟执行节奏更快 |
+
+调参次序：**默认起步 → 观测 `_pressure` / `_suppression` / `_decisions_drop_total` →
+只动与现象对应的那一个参数**（如“抑制太晚”先降 C 或降 target，而非同时调多个）。
+各 option 完整签名与约束见下文[进阶配置](#信号与决策的进阶配置)。
+
 ### 为什么我的请求被丢了？
 
 `ErrSuppressed` 意味着 governor 根据反馈判断下游已过载，在**发出之前**就丢弃了请求。
@@ -200,6 +262,15 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 远端恢复后 α 自动回落、放行率随之恢复，无需人工干预。
 
 ### 两种信号与多信号合成
+
+从反馈到抑制的完整公式链（推导与特性分析见 [desc.md](docs/desc.md) §3）：
+
+```text
+拒绝信号  S_rej = max(0, (N_total − K·N_success) / (N_total + 1))   成功率高于 1/K 时恒 0
+延迟信号  S_lat = max(0, (L_ewma − L_target) / L_target)            延迟低于目标时恒 0
+多信号    S     = max(S_1, …, S_n)                                 最差信号优先
+抑制因子  α     = clamp(S / (S + C), 0, 1)                          S=C 时 α=0.5，渐近 1 不达 1
+```
 
 ```go
 rej, _ := governor.NewRejectionSignal() // 场景 A：失败率超 1/K（默认容忍 50%）产生压力
@@ -276,23 +347,37 @@ lat, _ := governor.NewLatencySignal(
 
 ```go
 import (
+	"log/slog"
+
 	"github.com/jninng/observ"
-	obsprom "github.com/jninng/observ/adapters/prom"
 )
 
 g, _ := governor.New(
 	governor.WithSignals(lat),
-	governor.WithMeter(obsprom.New(registry)), // 默认 observ.NoopMeter
-	governor.WithLogger(zaplog.New(zapLogger)), // 缺省构造期快照 observ.DefaultLogger()
-	governor.WithMetricPrefix("redis"),        // 多实例区分（无 label 约束）
+	governor.WithLogger(observ.NewSlogLogger(slog.Default())), // 缺省快照 observ.DefaultLogger()
+	governor.WithMetricPrefix("redis"), // 多实例区分（无 label 约束）；默认 "governor"
 )
 ```
+
+`WithMeter` 接受任意 `observ.Meter` 实现（默认 `observ.NoopMeter`）；
+Prometheus / OTel 等适配器以 [observ](https://github.com/jninng/observ)
+仓库实际发布的模块为准。
 
 指标一览（前缀默认 `governor`）：`_pressure`、`_suppression`、`_batch_size`、
 `_wait_seconds`（gauge），`_decisions_allow_total` / `_decisions_drop_total` /
 `_decisions_probe_total`（counter），`_operations_seconds`（histogram）。
 放行决策只计 allow、探测放行只计 probe（互斥不叠加）；`_operations_seconds`
 只统计实际发往远端的操作耗时，被 `OutcomeIgnore` 分类（如调用方取消）的不计入。
+
+## 性能与并发模型
+
+- **并发安全**：每个 `Governor` 一把锁、每个信号一把锁；无后台协程、
+  无 ticker（滑窗惰性过期，读写时清理）。
+- **天然分片**：一个下游目标一个实例，锁不跨实例——多目标部署的竞争
+  随实例数摊薄，无需额外协调。
+- **开销定位**：控制路径是纯内存计算，成本远低于其保护的远端调用；
+  量级与扩展性请在自己的目标平台实测——[bench_test.go](bench_test.go)
+  头部含基线、并行度扩展、锁竞争（mutex profile）、CPU 热点四组命令。
 
 ## 能力边界（ADR-0002）
 

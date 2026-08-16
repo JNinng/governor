@@ -167,6 +167,9 @@ time=2026-08-15T23:48:52.437+08:00 level=WARN msg="governor: suppression started
 | 批量写入（不能丢，可减量） | 缩小批次 | `BatchSize` + `Begin` + `Record` |
 | 后台任务（可延迟） | 延迟执行（不丢弃） | `Wait` + `Record` |
 
+各策略的语义、公式、参数约束、指标与日志逐项参考见
+[docs/strategies.md](docs/strategies.md)（策略与参数手册）。
+
 #### ① 概率丢弃 — 接口请求
 
 ```go
@@ -253,6 +256,9 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 
 调参次序：**默认起步 → 观测 `_pressure` / `_suppression` / `_decisions_drop_total` →
 只动与现象对应的那一个参数**（如“抑制太晚”先降 C 或降 target，而非同时调多个）。
+运行中调参不必重启：C、探测比例、批次、基准等待可用 `Update` 原子生效，见
+[运行时更新参数](#运行时更新参数)；表中信号参数（K / target / β / 窗口）
+仅构造期可设，运行中的等价调节请用 `Update` 支持的四个参数。
 各 option 完整签名与约束见下文[进阶配置](#信号与决策的进阶配置)。
 
 ### 为什么我的请求被丢了？
@@ -343,6 +349,46 @@ lat, _ := governor.NewLatencySignal(
 - 各 `With*` option 传 `nil`（如 `WithClassifier(nil)`、`WithMeter(nil)`、
   `WithLogger(nil)`）一律构造失败；恢复默认只需不传该 option。
 
+### 运行时更新参数
+
+调节参数（`WithSensitivity` / `WithProbeRatio` / `WithBatch` / `WithBaseWait`）
+可在不停机的情况下通过 `Update` 生效——配合配置中心、管理端口或 SRE 预案动态调参，
+无需重建 Governor、丢失滑动窗口统计：
+
+```go
+// 观测到 "_suppression" 长期高位，把敏感度调保守、批次调小
+if err := g.Update(
+    governor.WithSensitivity(2.0),
+    governor.WithBatch(50, 5),
+); err != nil {
+    // 任一 option 报错、校验失败或试图变更结构性字段时，
+    // 当前配置原样保留，可安全重试
+}
+```
+
+- **原子生效**：全部 option 应用并校验通过后才整体切换；失败时旧配置仍在用。
+- **结构性字段不可变更**：信号集合、分类器、时钟、Meter、Logger、指标前缀、
+  随机源传入 `Update` 会被拒绝（信号类型与口径保持稳定，统计连续可比）。
+  **信号自身参数**（`WithRejectionK` / `WithRejectionWindow` / `WithLatencyTarget` /
+  `WithLatencyBeta` / `WithLatencyWindow`）同为构造期固定，运行时不可调整；
+  口径级变更（换 K / target / 窗口 / β）须按新口径重建信号与 Governor（统计清零）。
+- 更新成功记一条 INFO 日志（含各参数 from→to），便于审计谁在何时调了什么。
+
+全部参数的归属、默认值、约束与运行时可调性汇总见
+[策略与参数手册 · 参数总表](docs/strategies.md#参数总表)。
+
+#### 信号参数类诉求 → 在已支持动态调整的参数中处理
+
+运行中想改信号容忍度时，不必等重建——`Update` 支持的四个参数通常足以达到同等目的：
+
+| 想达到的效果 | 运行时的处理方式 |
+|---|---|
+| 改容忍度/灵敏度（K、target 的效果） | `Update(WithSensitivity(...))`：α = S/(S+C)，C 是全部信号共享的灵敏度旋钮，即时增减抑制强度（S=0 时调 C 无效果，属正常——无压力即无抑制） |
+| 深度抑制期反馈量 | `Update(WithProbeRatio(...))` |
+| 过载时单批冲击 | `Update(WithBatch(...))` |
+| 延迟执行节奏 | `Update(WithBaseWait(...))` |
+| 更换口径本身（K/窗口/target/β） | 不支持运行时调整，需重建信号与 Governor |
+
 ## 埋点（observ）
 
 ```go
@@ -388,5 +434,6 @@ Prometheus / OTel 等适配器以 [observ](https://github.com/jninng/observ)
 ## 文档
 
 - [CONTEXT.md](CONTEXT.md) — 领域术语表
+- [docs/strategies.md](docs/strategies.md) — 策略与参数手册（各策略公式、参数约束、指标与日志）
 - [docs/desc.md](docs/desc.md) — 算法理论设计
 - [docs/adr/](docs/adr/) — 架构决策记录

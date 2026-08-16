@@ -119,6 +119,17 @@ func (m *fakeMeter) histogramValues(name string) []float64 {
 type logEntry struct {
 	level slog.Level
 	msg   string
+	attrs []slog.Attr
+}
+
+// attr 返回日志条目中指定 key 的属性值。
+func (e logEntry) attr(key string) (slog.Value, bool) {
+	for _, a := range e.attrs {
+		if a.Key == key {
+			return a.Value, true
+		}
+	}
+	return slog.Value{}, false
 }
 
 type fakeLogger struct {
@@ -127,10 +138,10 @@ type fakeLogger struct {
 }
 
 func (l *fakeLogger) Enabled(slog.Level) bool { return true }
-func (l *fakeLogger) Log(level slog.Level, msg string, _ ...slog.Attr) {
+func (l *fakeLogger) Log(level slog.Level, msg string, attrs ...slog.Attr) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.entries = append(l.entries, logEntry{level, msg})
+	l.entries = append(l.entries, logEntry{level, msg, attrs})
 }
 
 func (l *fakeLogger) snapshot() []logEntry {
@@ -283,4 +294,43 @@ func TestDefaultObservabilityIsNoop(t *testing.T) {
 	_ = g.BatchSize()
 	_ = g.Wait(context.Background())
 	g.Allow()
+}
+
+// ---- 跃迁日志信号归因与深度抑制档位 ----
+
+func TestLoggerTransitionsDriverAndDeep(t *testing.T) {
+	lg := &fakeLogger{}
+	clk := newFakeClock()
+	sig, _ := NewLatencySignal(WithLatencyTarget(100*time.Millisecond), WithLatencyBeta(0.5))
+	g, _ := New(WithLogger(lg), WithClock(clk), WithSignals(sig))
+
+	// 1000ms 采样：S=9 → α=0.9，上穿 0.5 → WARN（started）
+	dec := g.Begin()
+	clk.advance(1000 * time.Millisecond)
+	dec.Record(nil)
+	// 第二次采样耗时 1100ms：EWMA=1050 → S=9.5 → α≈0.905，上穿 0.9 → WARN（deep）
+	dec = g.Begin()
+	clk.advance(1100 * time.Millisecond)
+	dec.Record(nil)
+
+	entries := lg.snapshot()
+	if len(entries) != 2 {
+		t.Fatalf("日志条目 = %d, want 2: %+v", len(entries), entries)
+	}
+	if entries[0].msg != "governor: suppression started (alpha went above 0.5)" {
+		t.Fatalf("首条消息 = %q", entries[0].msg)
+	}
+	if entries[1].level != slog.LevelWarn ||
+		entries[1].msg != "governor: deep suppression (alpha went above 0.9)" {
+		t.Fatalf("深度抑制日志 = [%v %q]", entries[1].level, entries[1].msg)
+	}
+	// 归因：驱动信号应为 latency（唯一信号，也是压力最大者）
+	for i, e := range entries {
+		if v, ok := e.attr("driver_signal"); !ok || v.String() != "latency" {
+			t.Fatalf("日志[%d] 缺少 driver_signal=latency 归因: %+v", i, e.attrs)
+		}
+		if _, ok := e.attr("driver_pressure"); !ok {
+			t.Fatalf("日志[%d] 缺少 driver_pressure: %+v", i, e.attrs)
+		}
+	}
 }

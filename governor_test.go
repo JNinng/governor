@@ -348,6 +348,7 @@ func TestNewValidation(t *testing.T) {
 		{"批次下限小于1", WithBatch(100, 0)},
 		{"批次上限小于下限", WithBatch(1, 10)},
 		{"空指标前缀", WithMetricPrefix("")},
+		{"nil 信号", WithSignals(nil)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -399,6 +400,152 @@ func TestConcurrentMixedPaths(t *testing.T) {
 				}
 			}
 		}(i)
+	}
+	wg.Wait()
+}
+
+// ---- 运行时参数更新 ----
+
+func TestUpdateAppliesTuningParams(t *testing.T) {
+	clk := newFakeClock()
+	sig, _ := NewLatencySignal(WithLatencyTarget(100*time.Millisecond), WithLatencyBeta(0.5))
+	lg := &fakeLogger{}
+	g, _ := New(WithSignals(sig), WithClock(clk), WithLogger(lg), WithBatch(100, 1))
+
+	// 制造压力：S=0.5
+	dec := g.Begin()
+	clk.advance(150 * time.Millisecond)
+	dec.Record(nil)
+
+	before := g.Suppression()
+	if err := g.Update(
+		WithSensitivity(0.1),
+		WithBatch(10, 5),
+		WithBaseWait(2*time.Second),
+		WithProbeRatio(0.1),
+	); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// C 从 1 降到 0.1：同压力下 α 应显著升高
+	after := g.Suppression()
+	if after <= before {
+		t.Fatalf("α 未随 C 降低而升高: before=%v after=%v", before, after)
+	}
+	if want := SuppressionFactor(0.5, 0.1); !almostEqual(after, want) {
+		t.Fatalf("α = %v, want %v", after, want)
+	}
+	// 批次上下限立即生效：α≈0.833 → floor(10×0.167)=1 < min → 5
+	if got := g.BatchSize(); got != 5 {
+		t.Fatalf("BatchSize = %d, want 5（新下限）", got)
+	}
+	// 基准等待立即生效：wait = 2s × α
+	g.Wait(context.Background())
+	if want := time.Duration(float64(2 * time.Second) * after); clk.lastSleep() != want {
+		t.Fatalf("Wait = %v, want %v（新基准 2s × α）", clk.lastSleep(), want)
+	}
+	// 更新成功应记一条 info 日志
+	found := false
+	for _, e := range lg.snapshot() {
+		if e.msg == "governor: config updated" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("缺少 config updated 日志")
+	}
+}
+
+func TestUpdateIsAtomic(t *testing.T) {
+	clk := newFakeClock()
+	sig, _ := NewLatencySignal(WithLatencyTarget(100*time.Millisecond), WithLatencyBeta(0.5))
+	g, _ := New(WithSignals(sig), WithClock(clk))
+
+	dec := g.Begin()
+	clk.advance(150 * time.Millisecond)
+	dec.Record(nil)
+	before := g.Suppression()
+
+	// 合法 option 后跟非法 option：整体失败
+	if err := g.Update(WithSensitivity(0.1), WithSensitivity(-1)); err == nil {
+		t.Fatal("应返回校验错误")
+	}
+	if got := g.Suppression(); !almostEqual(got, before) {
+		t.Fatalf("失败的 Update 改变了配置: %v, want %v", got, before)
+	}
+
+	// 校验失败（batch max < min）
+	if err := g.Update(WithBatch(1, 10)); err == nil {
+		t.Fatal("应返回校验错误")
+	}
+	if got := g.Suppression(); !almostEqual(got, before) {
+		t.Fatalf("失败的 Update 改变了配置: %v, want %v", got, before)
+	}
+}
+
+func TestUpdateRejectsStructuralOptions(t *testing.T) {
+	sig, _ := NewLatencySignal()
+	other, _ := NewRejectionSignal()
+	g, _ := New(WithSignals(sig), WithBatch(100, 1))
+	structural := []Option{
+		WithSignals(other),
+		WithClassifier(func(error) Outcome { return OutcomeSuccess }),
+		WithClock(newFakeClock()),
+		WithMeter(newFakeMeter()),
+		WithLogger(&fakeLogger{}),
+		WithMetricPrefix("other"),
+		withRandSource(float64s(0.5)),
+	}
+	for _, opt := range structural {
+		if err := g.Update(WithSensitivity(0.5), opt); err == nil {
+			t.Fatalf("结构性 option 应被 Update 拒绝: %v", opt)
+		}
+	}
+	// 拒绝后调节参数也不得生效
+	if err := g.Update(WithSensitivity(0.5)); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !almostEqual(g.Suppression(), SuppressionFactor(0, 0.5)) {
+		t.Fatalf("结构拒绝后配置应保持不变")
+	}
+}
+
+func TestUpdateConcurrentWithHotPaths(t *testing.T) {
+	clk := newFakeClock()
+	lat, _ := NewLatencySignal(WithLatencyTarget(50*time.Millisecond), WithLatencyBeta(0.5))
+	g, _ := New(
+		WithSignals(lat),
+		WithClock(clk),
+		WithBatch(100, 1),
+		WithBaseWait(time.Millisecond),
+		WithMeter(newFakeMeter()),
+		WithLogger(&fakeLogger{}),
+	)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_ = g.Update(WithSensitivity(0.5), WithProbeRatio(0.05), WithBatch(50, 2))
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				dec := g.Allow()
+				if dec.Allowed() {
+					dec.Record(nil)
+				}
+				_ = g.BatchSize()
+				_ = g.Pressure()
+				_ = g.Suppression()
+			}
+		}()
 	}
 	wg.Wait()
 }

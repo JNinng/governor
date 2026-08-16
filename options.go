@@ -32,6 +32,9 @@ type config struct {
 	logger     observ.Logger
 	prefix     string
 	source     rand.Source
+	// structural 标记本配置经结构性 option 修改过（信号集合/分类器/时钟/
+	// Meter/Logger/前缀/随机源）。Update 会拒绝此类变更并整体回退。
+	structural bool
 }
 
 func defaultConfig() *config {
@@ -49,6 +52,11 @@ func defaultConfig() *config {
 }
 
 func (c *config) validate() error {
+	for i, s := range c.signals {
+		if s == nil {
+			return fmt.Errorf("governor: signal[%d] must not be nil", i)
+		}
+	}
 	if c.c <= 0 {
 		return fmt.Errorf("governor: sensitivity C must be positive, got %v", c.c)
 	}
@@ -81,9 +89,11 @@ func defaultClassifier(err error) Outcome {
 type Option func(*config) error
 
 // WithSignals 设置压力信号集合（多信号取最差值合成）。
+// 仅构造期可变更：Update 时传入会被拒绝。
 func WithSignals(signals ...Signal) Option {
 	return func(c *config) error {
 		c.signals = signals
+		c.structural = true
 		return nil
 	}
 }
@@ -133,6 +143,7 @@ func WithClassifier(fn Classifier) Option {
 			return fmt.Errorf("governor: classifier must not be nil")
 		}
 		c.classifier = fn
+		c.structural = true
 		return nil
 	}
 }
@@ -144,6 +155,7 @@ func WithClock(clk Clock) Option {
 			return fmt.Errorf("governor: clock must not be nil")
 		}
 		c.clock = clk
+		c.structural = true
 		return nil
 	}
 }
@@ -156,6 +168,7 @@ func WithMeter(m observ.Meter) Option {
 			return fmt.Errorf("governor: meter must not be nil")
 		}
 		c.meter = m
+		c.structural = true
 		return nil
 	}
 }
@@ -167,6 +180,7 @@ func WithLogger(l observ.Logger) Option {
 			return fmt.Errorf("governor: logger must not be nil")
 		}
 		c.logger = l
+		c.structural = true
 		return nil
 	}
 }
@@ -176,6 +190,7 @@ func WithLogger(l observ.Logger) Option {
 func WithMetricPrefix(p string) Option {
 	return func(c *config) error {
 		c.prefix = p
+		c.structural = true
 		return nil
 	}
 }
@@ -187,6 +202,7 @@ func withRandSource(src rand.Source) Option {
 			return fmt.Errorf("governor: rand source must not be nil")
 		}
 		c.source = src
+		c.structural = true
 		return nil
 	}
 }

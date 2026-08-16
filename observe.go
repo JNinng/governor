@@ -65,6 +65,7 @@ func (lg logger) warn(msg string, attrs ...slog.Attr) {
 
 func slogAttrFloat(k string, v float64) slog.Attr { return slog.Float64(k, v) }
 func slogAttrInt(k string, v int) slog.Attr       { return slog.Int(k, v) }
+func slogAttrString(k, v string) slog.Attr        { return slog.String(k, v) }
 
 // seconds 把时长换算为秒（observ 命名规范：耗时一律 _seconds）。
 func seconds(d time.Duration) float64 { return d.Seconds() }

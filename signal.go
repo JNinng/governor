@@ -27,7 +27,7 @@ type Classifier func(err error) Outcome
 
 // Signal 是一类反馈输入到压力指数的独立计算单元，可脱离 Governor 单独复用。
 // 实现须并发安全。Pressure 只读无副作用（不修改任何统计状态）；
-// 统计饥饿（窗口无样本）时沿用上一次非空值，从未有样本时返回 0
+// 统计饥饿（窗口无样本）时沿用上一次计算出的压力，从未有样本时返回 0
 // （冷启动语义：区分“无反馈”与“无压力”，见 desc.md §3.1）。
 type Signal interface {
 	// Name 返回信号名，用于快照与日志标识。
@@ -179,7 +179,7 @@ const (
 // LatencySignal 以 EWMA 平滑后的响应耗时计算压力：
 // S = max(0, (L_actual - L_target) / L_target)，L_actual 为 EWMA 估计值
 // （desc.md §3.2 场景 B）。平滑系数 β 越大越平滑。
-// 超过 window 无新采样时沿用上一次非空压力（饥饿语义同 RejectionSignal）。
+// 超过 window 无新采样时沿用上一次计算出的压力（饥饿语义同 RejectionSignal）。
 type LatencySignal struct {
 	mu         sync.Mutex
 	target     time.Duration
@@ -217,7 +217,7 @@ func WithLatencyBeta(b float64) LatencyOption {
 }
 
 // WithLatencyWindow 设置采样饥饿阈值（默认 90s，与 RejectionSignal 窗口对齐），
-// 超过该时长无新采样时压力沿用上一次非空值，须 > 0。
+// 超过该时长无新采样时沿用上一次计算出的压力，须 > 0。
 func WithLatencyWindow(d time.Duration) LatencyOption {
 	return func(s *LatencySignal) error {
 		if d <= 0 {
@@ -265,7 +265,7 @@ func (s *LatencySignal) Observe(now time.Time, outcome Outcome, took time.Durati
 }
 
 // Pressure 实现 Signal（只读，不修改任何状态）。
-// 超过 window 无采样时视为饥饿，沿用上一次非空压力（desc.md §3.1）。
+// 超过 window 无采样时视为饥饿，沿用上一次计算出的压力（desc.md §3.1）。
 func (s *LatencySignal) Pressure(now time.Time) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()

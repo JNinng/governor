@@ -112,7 +112,7 @@ func TestGovernorConvergenceBatch(t *testing.T) {
 	}
 }
 
-// ---- §5.2 退避收敛闭环 ----
+// ---- §5.2 延迟收敛闭环 ----
 
 func TestGovernorConvergenceBackoff(t *testing.T) {
 	clk := newFakeClock()
@@ -126,13 +126,13 @@ func TestGovernorConvergenceBackoff(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	// 第一轮：无先验压力，直接探测
+	// 第一轮：无先验压力，直接执行
 	dec := g.Begin()
 	clk.advance(1000 * time.Millisecond)
 	dec.Record(nil)
 
 	base := 2000 * time.Millisecond
-	// 后续每轮：先按当前 α 退避，再执行同步；Wait 令牌记录退避后那次操作的耗时
+	// 后续每轮：先按当前 α 等待，再执行同步；Wait 令牌记录等待后那次操作的耗时
 	steps := []struct {
 		sample   time.Duration
 		wantWait time.Duration

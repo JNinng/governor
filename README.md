@@ -389,6 +389,66 @@ if err := g.Update(
 | 延迟执行节奏 | `Update(WithBaseWait(...))` |
 | 更换口径本身（K/窗口/target/β） | 不支持运行时调整，需重建信号与 Governor |
 
+## 传输层适配器
+
+调用点手工包 `Do` 的替代方案：适配器按下游自动创建并复用 Governor，自动完成决策与
+反馈（成败 + 耗时），不改 `Do`/`Allow` 契约，`ErrSuppressed` 照常透出给调用方降级。
+注册表持有在适配器实例内，非包级全局；Governor 仍可脱离适配器单独构造与使用。
+
+### HTTP（RoundTripper）
+
+`adapter/httpx`（`governorhttp`），纯标准库，随核心模块分发：
+
+```go
+import governorhttp "github.com/jninng/governor/adapter/httpx"
+
+tr, err := governorhttp.New(nil) // nil 时底层用 http.DefaultTransport
+if err != nil { /* ... */ }
+client := &http.Client{Transport: tr}
+
+resp, err := client.Get(url)
+if errors.Is(err, governor.ErrSuppressed) {
+    return fallback, nil // 过载被本地丢弃：请求未发出，在此降级
+}
+
+// 请求级旁路：health check 等不参与抑制（不判定、不记录）
+req = req.WithContext(governorhttp.WithoutSuppression(ctx))
+```
+
+按 host 惰性创建 Governor：默认信号 `RejectionSignal`（K=2、窗口 90s）；默认分类为
+网络错误与 429/5xx 记失败、调用方取消不计入、其余成功；指标前缀 `governor_<host>`
+（host 中的 `.`、`:` 等字符替换为 `_`）。信号工厂、分类器、C、探测比例、前缀与
+Meter 均可经 option 调整；`Governor(host)` 可取实例查询只读状态。
+
+### gRPC（client interceptor）
+
+`adapter/grpcx`（`governorgrpc`），独立 module：核心库不引入 grpc-go 依赖
+（ADR-0001 同款考量），用到的项目单独引入：
+
+```go
+import governorgrpc "github.com/jninng/governor/adapter/grpcx"
+
+ix, err := governorgrpc.New()
+if err != nil { /* ... */ }
+conn, err := grpc.NewClient(target,
+    grpc.WithTransportCredentials(insecure.NewCredentials()),
+    grpc.WithChainUnaryInterceptor(ix.Unary()),
+    grpc.WithChainStreamInterceptor(ix.Stream()),
+)
+
+err = conn.Invoke(ctx, method, req, reply)
+if errors.Is(err, governor.ErrSuppressed) {
+    return fallback, nil // 在此降级
+}
+```
+
+按 ClientConn target 惰性创建 Governor（同一 target 的多个连接共享一个实例）。
+unary 以一次调用为一操作；stream 以流结束为一操作——`RecvMsg` 返回 `io.EOF` 记成功、
+任一方向出错按分类记录，未读完即弃用则不记录（与两段式不 `Record` 同语义）。
+默认分类：`ResourceExhausted` / `Unavailable` / `DeadlineExceeded` 记失败
+（429/503 与超时的等价码），`Canceled` 及其余错误码不计入（多与业务语义相关而非
+过载），可经 `WithClassifier` 整体替换。option 与 HTTP 适配器一致。
+
 ## 埋点（observ）
 
 ```go

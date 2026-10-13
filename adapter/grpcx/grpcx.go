@@ -8,9 +8,9 @@
 //   - 命中抑制时 RPC 直接返回 governor.ErrSuppressed（未发往远端），
 //     调用方以 errors.Is 判别后降级；
 //   - unary：一次调用为一操作，invoker 返回后自动 Record；
-//   - stream：建流成功即放行，以流结束为一操作——RecvMsg 返回 io.EOF 记成功、
-//     任一方向出错按分类记录；业务未读完流即弃用则不记录
-//     （与两段式不 Record 同语义）；
+//   - stream：建流成功即放行，以流结束为一操作——RecvMsg 返回 io.EOF 记成功，
+//     其余错误（含 SendMsg 因传输写失败返回的 io.EOF，grpc 契约允许）按分类记录；
+//     业务未读完流即弃用则不记录（与两段式不 Record 同语义）；
 //   - 请求级旁路：ctx 带 WithoutSuppression 标记的调用完全绕过抑制与反馈。
 //
 // 默认结局分类：ResourceExhausted / Unavailable（429/503 的等价码）与
@@ -55,6 +55,7 @@ import (
 type Interceptor struct {
 	mu         sync.RWMutex
 	governors  map[string]*governor.Governor
+	prefixes   map[string]string // 规整后的指标前缀 → target，创建时检测碰撞
 	newSignals func() ([]governor.Signal, error)
 	classify   func(err error) governor.Outcome
 	prefix     func(target string) string
@@ -68,6 +69,7 @@ type Interceptor struct {
 func New(opts ...Option) (*Interceptor, error) {
 	ix := &Interceptor{
 		governors:  make(map[string]*governor.Governor),
+		prefixes:   make(map[string]string),
 		newSignals: defaultSignals,
 		classify:   defaultClassify,
 		prefix:     defaultPrefix,
@@ -125,9 +127,9 @@ func (ix *Interceptor) Stream() grpc.StreamClientInterceptor {
 		}
 		return &recordingStream{
 			ClientStream: cs,
-			finish: func(done error) {
-				if errors.Is(done, io.EOF) {
-					dec.Record(nil) // 流正常读完：记成功
+			finish: func(done error, fromRecv bool) {
+				if fromRecv && errors.Is(done, io.EOF) {
+					dec.Record(nil) // RecvMsg 的 io.EOF：流正常读完，记成功
 					return
 				}
 				dec.Record(ix.recordInput(done))
@@ -212,7 +214,8 @@ func WithProbeRatio(r float64) Option {
 
 // WithMetricPrefix 注入指标前缀函数。observ 无 label，前缀是唯一合规的实例级隔离
 // 手段（ADR-0001）；nil 报错；不传时默认 "governor_<target>"（target 中除
-// [a-z0-9_] 外的字符替换为下划线）。
+// [a-z0-9_] 外的字符替换为下划线）。不同 target 规整后产生相同前缀时，后创建的
+// target 报错，自定义前缀函数的输出同样参与检测。
 func WithMetricPrefix(prefix func(target string) string) Option {
 	return func(ix *Interceptor) error {
 		if prefix == nil {
@@ -315,7 +318,7 @@ func sanitize(s string) string {
 
 // governorFor 返回 target 对应的 Governor，惰性创建；构造失败返回错误且不缓存。
 // 双重检查：读锁命中直返，未命中升级写锁后再查一次（并发首访同一 target 只构造
-// 一次）。
+// 一次）。不同 target 规整后产生相同指标前缀时报错（如 "a.b:1" 与 "a_b:1"）。
 func (ix *Interceptor) governorFor(target string) (*governor.Governor, error) {
 	ix.mu.RLock()
 	g, ok := ix.governors[target]
@@ -328,22 +331,30 @@ func (ix *Interceptor) governorFor(target string) (*governor.Governor, error) {
 	if g, ok := ix.governors[target]; ok {
 		return g, nil
 	}
-	g, err := ix.build(target)
+	prefix := ix.prefix(target)
+	if existing, ok := ix.prefixes[prefix]; ok {
+		// 走到这里说明 target 尚未创建，前缀已被其他 target 占用即碰撞。
+		return nil, fmt.Errorf(
+			"governor/grpcx: metric prefix %q of target %q collides with target %q; targets must be unique after prefix sanitization (see WithMetricPrefix)",
+			prefix, target, existing)
+	}
+	g, err := ix.build(target, prefix)
 	if err != nil {
 		return nil, err
 	}
 	ix.governors[target] = g
+	ix.prefixes[prefix] = target
 	return g, nil
 }
 
-func (ix *Interceptor) build(target string) (*governor.Governor, error) {
+func (ix *Interceptor) build(target, prefix string) (*governor.Governor, error) {
 	sigs, err := ix.newSignals()
 	if err != nil {
 		return nil, fmt.Errorf("governor/grpcx: build signals for target %q: %w", target, err)
 	}
 	opts := []governor.Option{
 		governor.WithSignals(sigs...),
-		governor.WithMetricPrefix(ix.prefix(target)),
+		governor.WithMetricPrefix(prefix),
 		governor.WithClassifier(coreClassifier),
 	}
 	if ix.meter != nil {
@@ -362,18 +373,19 @@ func (ix *Interceptor) build(target string) (*governor.Governor, error) {
 	return g, nil
 }
 
-// recordingStream 包装 ClientStream，把流结束作为一次操作记录：
-// RecvMsg 返回 io.EOF 记成功，任一方向出错按分类记录（只记首个终态）。
+// recordingStream 包装 ClientStream，把流结束作为一次操作记录（只记首个终态）：
+// RecvMsg 的 io.EOF 是流正常读完，记成功；其余错误（含 SendMsg 因传输写失败
+// 返回的 io.EOF，grpc 契约允许）按分类记录，默认不计入。
 type recordingStream struct {
 	grpc.ClientStream
-	finish func(err error)
+	finish func(err error, fromRecv bool)
 	once   sync.Once
 }
 
 func (s *recordingStream) SendMsg(m any) error {
 	err := s.ClientStream.SendMsg(m)
 	if err != nil {
-		s.once.Do(func() { s.finish(err) })
+		s.once.Do(func() { s.finish(err, false) })
 	}
 	return err
 }
@@ -381,7 +393,7 @@ func (s *recordingStream) SendMsg(m any) error {
 func (s *recordingStream) RecvMsg(m any) error {
 	err := s.ClientStream.RecvMsg(m)
 	if err != nil {
-		s.once.Do(func() { s.finish(err) })
+		s.once.Do(func() { s.finish(err, true) })
 	}
 	return err
 }

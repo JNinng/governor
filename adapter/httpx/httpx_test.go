@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jninng/governor"
+	"github.com/jninng/observ"
 )
 
 // countingSignal 记录 Observe 喂入的结局分布，Pressure 恒 0（只测分类，不触发抑制）。
@@ -416,5 +417,98 @@ func TestConcurrentRequests(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Fatal(err)
+	}
+}
+
+// ---- 指标前缀与碰撞检测 ----
+
+type recordingMeter struct {
+	mu    sync.Mutex
+	names []string
+}
+
+func (m *recordingMeter) record(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.names = append(m.names, name)
+}
+
+func (m *recordingMeter) created() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.names...)
+}
+
+func (m *recordingMeter) NewCounter(name, _ string) observ.Counter {
+	m.record(name)
+	return nopCounter{}
+}
+func (m *recordingMeter) NewGauge(name, _ string) observ.Gauge { m.record(name); return nopGauge{} }
+func (m *recordingMeter) NewHistogram(name, _ string, _ []float64) observ.Histogram {
+	m.record(name)
+	return nopHistogram{}
+}
+
+type nopCounter struct{}
+
+func (nopCounter) Inc()        {}
+func (nopCounter) Add(float64) {}
+
+type nopGauge struct{}
+
+func (nopGauge) Set(float64) {}
+func (nopGauge) Add(float64) {}
+
+type nopHistogram struct{}
+
+func (nopHistogram) Observe(float64) {}
+
+func TestMetricPrefixPerHost(t *testing.T) {
+	srv := statusServer(http.StatusOK, nil)
+	defer srv.Close()
+	m := &recordingMeter{}
+	tr, err := New(nil, WithMeter(m))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	resp.Body.Close()
+
+	prefix := "governor_" + sanitize(hostOf(srv.URL)) + "_"
+	for _, name := range m.created() {
+		if len(name) < len(prefix) || name[:len(prefix)] != prefix {
+			t.Fatalf("指标名 %q 未使用按 host 生成的前缀 %q", name, prefix)
+		}
+	}
+	found := false
+	for _, name := range m.created() {
+		if name == prefix+"pressure" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("未找到 %spressure，got %v", prefix, m.created())
+	}
+}
+
+func TestPrefixCollisionBetweenHosts(t *testing.T) {
+	tr, err := New(nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := tr.Governor("a.b:80"); err != nil {
+		t.Fatalf("Governor(a.b:80): %v", err)
+	}
+	// "a.b:80" 与 "a_b:80" 规整后同为 governor_a_b_80。
+	if _, err := tr.Governor("a_b:80"); err == nil {
+		t.Fatalf("前缀碰撞应报错")
+	}
+	// 已创建的 host 不受影响。
+	if _, err := tr.Governor("a.b:80"); err != nil {
+		t.Fatalf("已有 host 应正常复用: %v", err)
 	}
 }

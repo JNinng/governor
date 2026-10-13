@@ -10,6 +10,11 @@
 //     不做 Allow 判定（不会 ErrSuppressed）、不 Record（不进任何统计），
 //     适用于 health check 等不参与抑制的调用。
 //
+// 口径边界：成败记录止步于 RoundTrip——响应体读取阶段的失败（截断、解码错误）
+// 发生在 Record 之后，不进反馈；需要体级成败口径的业务改用 governor.Do / 两段式。
+// http.Client 的重定向每一跳独立判定与记录，链路中途被抑制表现为包装了
+// ErrSuppressed 的 *url.Error。
+//
 // 边界：host→Governor 注册表持有在 Transport 实例内，非包级全局；Transport 可独立
 // 构造与丢弃，Governor 仍可脱离适配器单独构造与使用。
 //
@@ -43,6 +48,7 @@ type Transport struct {
 
 	mu         sync.RWMutex
 	governors  map[string]*governor.Governor
+	prefixes   map[string]string // 规整后的指标前缀 → host，创建时检测碰撞
 	newSignals func() ([]governor.Signal, error)
 	classify   func(resp *http.Response, err error) governor.Outcome
 	prefix     func(host string) string
@@ -57,6 +63,7 @@ func New(base http.RoundTripper, opts ...Option) (*Transport, error) {
 	t := &Transport{
 		base:       base,
 		governors:  make(map[string]*governor.Governor),
+		prefixes:   make(map[string]string),
 		newSignals: defaultSignals,
 		classify:   defaultClassify,
 		prefix:     defaultPrefix,
@@ -130,7 +137,8 @@ func WithSignalFactory(newSignals func() ([]governor.Signal, error)) Option {
 }
 
 // WithClassifier 注入结局分类器，整体替换默认分类（网络错误/429/5xx 失败、
-// 调用方取消忽略、其余成功）。nil 报错。
+// 调用方取消忽略、其余成功）。err 非 nil 时 resp 恒为 nil（RoundTripper 契约），
+// 自定义分类器须先判 err。nil 报错。
 func WithClassifier(classify func(resp *http.Response, err error) governor.Outcome) Option {
 	return func(t *Transport) error {
 		if classify == nil {
@@ -167,7 +175,8 @@ func WithProbeRatio(r float64) Option {
 
 // WithMetricPrefix 注入指标前缀函数。observ 无 label，前缀是唯一合规的实例级隔离
 // 手段（ADR-0001）；nil 报错；不传时默认 "governor_<host>"（host 中除 [a-z0-9_]
-// 外的字符替换为下划线）。
+// 外的字符替换为下划线）。不同 host 规整后产生相同前缀时，后创建的 host 报错，
+// 自定义前缀函数的输出同样参与检测。
 func WithMetricPrefix(prefix func(host string) string) Option {
 	return func(t *Transport) error {
 		if prefix == nil {
@@ -271,7 +280,8 @@ func sanitize(s string) string {
 }
 
 // governorFor 返回 host 对应的 Governor，惰性创建；构造失败返回错误且不缓存。
-// 双重检查：读锁命中直返，未命中升级写锁后再查一次（并发首访同一 host 只构造一次）。
+// 双重检查：读锁命中直返，未命中升级写锁后再查一次（并发首访同一 host 只构造
+// 一次）。不同 host 规整后产生相同指标前缀时报错（如 "a.b:80" 与 "a_b:80"）。
 func (t *Transport) governorFor(host string) (*governor.Governor, error) {
 	t.mu.RLock()
 	g, ok := t.governors[host]
@@ -284,22 +294,30 @@ func (t *Transport) governorFor(host string) (*governor.Governor, error) {
 	if g, ok := t.governors[host]; ok {
 		return g, nil
 	}
-	g, err := t.build(host)
+	prefix := t.prefix(host)
+	if existing, ok := t.prefixes[prefix]; ok {
+		// 走到这里说明 host 尚未创建，前缀已被其他 host 占用即碰撞。
+		return nil, fmt.Errorf(
+			"governor/httpx: metric prefix %q of host %q collides with host %q; hosts must be unique after prefix sanitization (see WithMetricPrefix)",
+			prefix, host, existing)
+	}
+	g, err := t.build(host, prefix)
 	if err != nil {
 		return nil, err
 	}
 	t.governors[host] = g
+	t.prefixes[prefix] = host
 	return g, nil
 }
 
-func (t *Transport) build(host string) (*governor.Governor, error) {
+func (t *Transport) build(host, prefix string) (*governor.Governor, error) {
 	sigs, err := t.newSignals()
 	if err != nil {
 		return nil, fmt.Errorf("governor/httpx: build signals for host %q: %w", host, err)
 	}
 	opts := []governor.Option{
 		governor.WithSignals(sigs...),
-		governor.WithMetricPrefix(t.prefix(host)),
+		governor.WithMetricPrefix(prefix),
 		governor.WithClassifier(coreClassifier),
 	}
 	if t.meter != nil {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jninng/governor"
+	"github.com/jninng/observ"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -310,6 +311,12 @@ func TestStreamRecordsOnEOFAndError(t *testing.T) {
 	if err := s.RecvMsg(struct{}{}); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("RecvMsg 应透出错误，got %v", err)
 	}
+	// SendMsg 返回 io.EOF（传输写失败时 grpc 契约允许）：不是正常读完，按分类
+	// 记录——默认 Unknown 不计入。
+	s = open(&fakeStream{sendErr: io.EOF}, nil)
+	if err := s.SendMsg(struct{}{}); !errors.Is(err, io.EOF) {
+		t.Fatalf("SendMsg 应透出 io.EOF，got %v", err)
+	}
 
 	success, failure, ignore := sig.counts()
 	if success != 1 {
@@ -318,8 +325,8 @@ func TestStreamRecordsOnEOFAndError(t *testing.T) {
 	if failure != 2 {
 		t.Fatalf("failure = %d, want 2", failure)
 	}
-	if ignore != 0 {
-		t.Fatalf("ignore = %d, want 0", ignore)
+	if ignore != 1 { // SendMsg 的 io.EOF 不计为成功
+		t.Fatalf("ignore = %d, want 1", ignore)
 	}
 }
 
@@ -433,5 +440,97 @@ func TestDefaultPrefixSanitize(t *testing.T) {
 		if got := defaultPrefix(tt.target); got != tt.want {
 			t.Fatalf("defaultPrefix(%q) = %q, want %q", tt.target, got, tt.want)
 		}
+	}
+}
+
+// ---- 指标前缀与碰撞检测 ----
+
+type recordingMeter struct {
+	mu    sync.Mutex
+	names []string
+}
+
+func (m *recordingMeter) record(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.names = append(m.names, name)
+}
+
+func (m *recordingMeter) created() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.names...)
+}
+
+func (m *recordingMeter) NewCounter(name, _ string) observ.Counter {
+	m.record(name)
+	return nopCounter{}
+}
+func (m *recordingMeter) NewGauge(name, _ string) observ.Gauge { m.record(name); return nopGauge{} }
+func (m *recordingMeter) NewHistogram(name, _ string, _ []float64) observ.Histogram {
+	m.record(name)
+	return nopHistogram{}
+}
+
+type nopCounter struct{}
+
+func (nopCounter) Inc()        {}
+func (nopCounter) Add(float64) {}
+
+type nopGauge struct{}
+
+func (nopGauge) Set(float64) {}
+func (nopGauge) Add(float64) {}
+
+type nopHistogram struct{}
+
+func (nopHistogram) Observe(float64) {}
+
+func TestMetricPrefixPerTarget(t *testing.T) {
+	m := &recordingMeter{}
+	ix, err := New(WithMeter(m))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cc := newConn(t, "a.example:1")
+	inv := &countingInvoker{}
+	unary := ix.Unary()
+	if err := unary(context.Background(), "/pkg.Svc/Method", struct{}{}, struct{}{},
+		cc, inv.invoke); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+
+	prefix := "governor_a_example_1_"
+	for _, name := range m.created() {
+		if len(name) < len(prefix) || name[:len(prefix)] != prefix {
+			t.Fatalf("指标名 %q 未使用按 target 生成的前缀 %q", name, prefix)
+		}
+	}
+	found := false
+	for _, name := range m.created() {
+		if name == prefix+"pressure" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("未找到 %spressure，got %v", prefix, m.created())
+	}
+}
+
+func TestPrefixCollisionBetweenTargets(t *testing.T) {
+	ix, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := ix.Governor("a.b:1"); err != nil {
+		t.Fatalf("Governor(a.b:1): %v", err)
+	}
+	// "a.b:1" 与 "a_b:1" 规整后同为 governor_a_b_1。
+	if _, err := ix.Governor("a_b:1"); err == nil {
+		t.Fatalf("前缀碰撞应报错")
+	}
+	// 已创建的 target 不受影响。
+	if _, err := ix.Governor("a.b:1"); err != nil {
+		t.Fatalf("已有 target 应正常复用: %v", err)
 	}
 }

@@ -389,6 +389,42 @@ if err := g.Update(
 | 延迟执行节奏 | `Update(WithBaseWait(...))` |
 | 更换口径本身（K/窗口/target/β） | 不支持运行时调整，需重建信号与 Governor |
 
+## 多下游管理器（Group）
+
+"一个下游目标一个实例"的原则不变；下游多了以后，用 Group 免去逐实例 `New`、
+拼前缀、逐个查快照。按 key 惰性创建并复用，统一生成指标前缀，聚合信号快照。
+Group 是构造便利工具，**不是全局单例**：各实例独立持锁（天然分片语义不变），
+仍可脱离 Group 单独构造与使用。实例的操作不经过 Group 的锁（`Get` 本身取读锁，
+建议启动期获取实例并长期复用，而非每个请求调用一次）。
+
+```go
+grp, err := governor.NewGroup()
+if err != nil { /* ... */ }
+
+user, err := grp.Get("user-service") // 惰性创建，同 key 复用同一实例
+if err != nil { /* ... */ }
+v, err := governor.Do(ctx, user, callUser) // 用法与普通 Governor 完全一致
+
+for key, snaps := range grp.Signals() { // 聚合信号快照：map[key][]SignalSnapshot
+    for _, s := range snaps {
+        log.Printf("%s signal=%s pressure=%v", key, s.Name, s.Pressure)
+    }
+}
+```
+
+- **信号逐实例创建**：信号持有可变统计状态，不可跨实例共享，故经
+  `WithSignalFactory` 工厂创建（默认 `RejectionSignal`，K=2、窗口 90s）；
+  `WithKeyPrefix` 自定义前缀函数，默认 `governor_<key>`（key 中的 `.`、`:`
+  等字符替换为 `_`）。
+- **模板 option**：`WithGovernorOptions(...)` 透传核心 option（C、探测比例、
+  批次、基准等待、分类器、Meter 等）到每个实例；其中的 `WithSignals` /
+  `WithMetricPrefix` 会被 Group 接管的同名配置覆盖。
+- **前缀碰撞检测**：不同 key 经前缀规整后若产生相同指标前缀（如 `user.service`
+  与 `user_service`），后创建的 key 报错——key 须在规整后唯一，或经
+  `WithKeyPrefix` 自定义消除；自定义前缀函数的输出同样参与检测。
+- `Get` 对空 key 报错；实例构造失败时报错且不缓存（下次调用重试）；
+  `Keys()` 枚举已创建实例，`Signals()` 仅含已创建的实例。
+
 ## 传输层适配器
 
 调用点手工包 `Do` 的替代方案：适配器按下游自动创建并复用 Governor，自动完成决策与
@@ -420,6 +456,11 @@ req = req.WithContext(governorhttp.WithoutSuppression(ctx))
 （host 中的 `.`、`:` 等字符替换为 `_`）。信号工厂、分类器、C、探测比例、前缀与
 Meter 均可经 option 调整；`Governor(host)` 可取实例查询只读状态。
 
+两点口径说明：成败记录止步于 RoundTrip，响应体读取阶段的失败（截断、解码错误）
+不进反馈，需要体级成败口径的业务改用 `governor.Do`/两段式；http.Client 的重定向
+每一跳独立判定与记录，链路中途被抑制表现为包装了 `ErrSuppressed` 的 `*url.Error`。
+不同 host 规整后产生相同指标前缀（如 `a.b:80` 与 `a_b:80`）时，后创建的 host 报错。
+
 ### gRPC（client interceptor）
 
 `adapter/grpcx`（`governorgrpc`），独立 module：核心库不引入 grpc-go 依赖
@@ -444,10 +485,12 @@ if errors.Is(err, governor.ErrSuppressed) {
 
 按 ClientConn target 惰性创建 Governor（同一 target 的多个连接共享一个实例）。
 unary 以一次调用为一操作；stream 以流结束为一操作——`RecvMsg` 返回 `io.EOF` 记成功、
-任一方向出错按分类记录，未读完即弃用则不记录（与两段式不 `Record` 同语义）。
+其余错误按分类记录（含 `SendMsg` 因传输写失败返回的 `io.EOF`，grpc 契约允许），
+未读完即弃用则不记录（与两段式不 `Record` 同语义）。
 默认分类：`ResourceExhausted` / `Unavailable` / `DeadlineExceeded` 记失败
 （429/503 与超时的等价码），`Canceled` 及其余错误码不计入（多与业务语义相关而非
-过载），可经 `WithClassifier` 整体替换。option 与 HTTP 适配器一致。
+过载），可经 `WithClassifier` 整体替换。option 与 HTTP 适配器一致；不同 target
+规整后前缀碰撞同样会在创建时报错。
 
 ## 埋点（observ）
 

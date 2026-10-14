@@ -64,15 +64,16 @@ type targetEntry struct {
 // Interceptor 持有按 target 惰性创建的 Governor 注册表：Unary 与 Stream 共用。
 // 并发安全；多连接共享同一实例。
 type Interceptor struct {
-	mu         sync.RWMutex
-	targets    map[string]*targetEntry
-	prefixes   map[string]string // 规整后的指标前缀 → target，创建时检测碰撞
-	newSignals func() ([]governor.Signal, error)
-	classify   func(err error) governor.Outcome
-	prefix     func(target string) string
-	meter      observ.Meter
-	sensitiv   *float64
-	probeRatio *float64
+	mu           sync.RWMutex
+	targets      map[string]*targetEntry
+	prefixes     map[string]string // 规整后的指标前缀 → target，创建时检测碰撞
+	newSignals   func() ([]governor.Signal, error)
+	classify     func(err error) governor.Outcome
+	prefix       func(target string) string
+	meter        observ.Meter
+	sensitiv     *float64
+	probeRatio   *float64
+	onTransition func(target string, tr governor.Transition)
 }
 
 // New 创建适配器。任一 option 非法时报错（与 governor.New 一致，构造失败不产生
@@ -270,6 +271,19 @@ func WithMeter(m observ.Meter) Option {
 	}
 }
 
+// WithOnTransition 注入状态跃迁回调：各 target 实例的跃迁按 target 归因后转发，
+// 语义同 governor.WithOnTransition（构造期固定、锁外同步派发、panic 一律
+// recover、只推低频跃迁）。nil 报错。
+func WithOnTransition(fn func(target string, tr governor.Transition)) Option {
+	return func(ix *Interceptor) error {
+		if fn == nil {
+			return fmt.Errorf("governor/grpcx: on-transition callback must not be nil")
+		}
+		ix.onTransition = fn
+		return nil
+	}
+}
+
 // ---- 内部 ----
 
 // 分类结果到 Record 输入的桥接：Record 只接收 error，成功传 nil、忽略与失败传
@@ -405,6 +419,11 @@ func (ix *Interceptor) build(target, prefix string) (*targetEntry, error) {
 	}
 	if ix.probeRatio != nil {
 		opts = append(opts, governor.WithProbeRatio(*ix.probeRatio))
+	}
+	if ix.onTransition != nil {
+		opts = append(opts, governor.WithOnTransition(func(tr governor.Transition) {
+			ix.onTransition(target, tr)
+		}))
 	}
 	g, err := governor.New(opts...)
 	if err != nil {

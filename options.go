@@ -33,8 +33,10 @@ type config struct {
 	prefix     string
 	source     rand.Source
 	// structural 标记本配置经结构性 option 修改过（信号集合/分类器/时钟/
-	// Meter/Logger/前缀/随机源）。Update 会拒绝此类变更并整体回退。
+	// Meter/Logger/前缀/跃迁回调/随机源）。Update 会拒绝此类变更并整体回退。
 	structural bool
+
+	onTransition func(Transition)
 }
 
 func defaultConfig() *config {
@@ -190,6 +192,24 @@ func WithLogger(l observ.Logger) Option {
 func WithMetricPrefix(p string) Option {
 	return func(c *config) error {
 		c.prefix = p
+		c.structural = true
+		return nil
+	}
+}
+
+// WithOnTransition 注入状态跃迁回调（构造期固定，Update 拒绝更换）。
+// 跃迁发生时在锁外同步派发 Transition——慢回调只拖慢触发它的那次调用，
+// 不阻塞其他请求，但仍须快速返回；panic 一律 recover。只推跃迁（低频），
+// DEBUG 级 wait/batch 逐次变化不进回调。Kind 判定沿用既有跃迁优先级：
+// α 从 <0.5 直接越过 0.9 时只发 suppression_started、不发 deep_suppression。
+// nil 一律报错；恢复默认只需不传该 option。回调里做告警/webhook 可以，
+// 改变配置不行（观测不是控制）。
+func WithOnTransition(fn func(Transition)) Option {
+	return func(c *config) error {
+		if fn == nil {
+			return fmt.Errorf("governor: on-transition callback must not be nil")
+		}
+		c.onTransition = fn
 		c.structural = true
 		return nil
 	}

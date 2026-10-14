@@ -22,6 +22,7 @@ import (
 func main() {
 	// 以 Info 级别阈值接入 slog：只显示状态跃迁（WARN suppression started /
 	// INFO suppression stopped），DEBUG 级调整明细静默。
+	// http 路径不使用 Wait，无 wait engaged/released 跃迁。
 	// 不设置时缺省为 Noop，指标日志均零开销。
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	observ.SetDefaultLogger(observ.NewSlogLogger(logger))

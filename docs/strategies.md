@@ -29,6 +29,19 @@
 | α 上穿 0.9 | WARN | `governor: deep suppression (alpha went above 0.9)` | 同上 |
 | α 归 0 | INFO | `governor: suppression stopped (alpha reached 0)` | 同上 |
 
+状态跃迁回调（`WithOnTransition`，构造期固定，`Update` 拒绝更换）：跃迁发生时
+锁外同步派发 `Transition{Kind, From, To, Driver, DriverPressure}`，与上表日志
+同源同频（锁内日志有序；锁外派发的回调间不保证全局到达顺序，顺序以事件的
+From/To 为准）。同步调用、必须快速返回、panic 一律 recover。只推跃迁（低频），
+DEBUG 级 wait/batch 逐次变化不进回调。Kind 一览：
+
+| Kind | From / To | 触发路径 |
+|---|---|---|
+| `suppression_started` | 跃迁前后的 α | `Record` |
+| `deep_suppression` | 同上 | `Record`；α 从 <0.5 直接越过 0.9 时跳过（只发 started） |
+| `suppression_stopped` | 同上 | `Record` |
+| `wait_engaged` / `wait_released` | 跃迁前后的等待秒数（wait = T_base×α） | `Wait` |
+
 ---
 
 ## 策略一：概率丢弃（`Allow` / `Do`）
@@ -157,6 +170,8 @@ for {
 | 名称 | 类型 | 含义 |
 |---|---|---|
 | `_wait_seconds` | gauge | 当前等待时长（秒） |
+| `governor: wait engaged (wait went above 0)` | INFO | wait 首次非零（`wait_seconds`、`driver_signal` 归因） |
+| `governor: wait released (wait reached 0)` | INFO | wait 归零 |
 | `governor: wait changed` | DEBUG | 等待变化时记录（from_seconds→to_seconds） |
 
 ### 适用与示例

@@ -17,8 +17,9 @@ import (
 )
 
 func main() {
-	// 以 Info 级别阈值接入 slog：只记录状态跃迁
-	// （WARN suppression started / INFO suppression stopped），
+	// 以 Info 级别阈值接入 slog：只记录低频状态跃迁
+	// （INFO wait engaged / WARN suppression started /
+	// INFO suppression stopped / INFO wait released），
 	// DEBUG 级的 wait changed 明细静默——生产推荐的安静模式。
 	// 想看每次等待变化时把 Level 调为 slog.LevelDebug 即可。不设置时缺省为 Noop。
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))

@@ -109,7 +109,7 @@ func (g *Governor) Update(opts ...Option) error {
 		}
 	}
 	if cfg.structural {
-		return fmt.Errorf("governor: signals, classifier, clock, meter, logger, metric prefix and rand source cannot be changed at runtime")
+		return fmt.Errorf("governor: signals, classifier, clock, meter, logger, metric prefix, transition callback and rand source cannot be changed at runtime")
 	}
 	if err := cfg.validate(); err != nil {
 		return err
@@ -152,6 +152,10 @@ func (g *Governor) Allow() *Decision {
 // Wait 是策略三（延迟执行）：按 T_base × α 休眠后返回反馈令牌。
 // 延迟而不丢弃——没有任何请求被丢，只是延后发出；不是失败后的退避重试（ADR-0002）。
 // ctx 在调用时已取消/超时的，跳过睡眠直接返回令牌。
+// wait 生效/解除跃迁（与 α 路径对称的低频事件）在此检测：锁内判定归因，
+// 锁外记 INFO 跃迁日志并派发 OnTransition 回调。跃迁反映等待配置的状态
+// （首次非零 / 归零），与该次调用是否实际发生睡眠无关（如 ctx 已取消时
+// 跳过睡眠，事件照发）。
 func (g *Governor) Wait(ctx context.Context) *Decision {
 	cfg := g.cfg.Load()
 	alpha := g.currentAlpha()
@@ -163,11 +167,31 @@ func (g *Governor) Wait(ctx context.Context) *Decision {
 		g.lastWait = wait
 		g.metrics.waitSeconds.Set(seconds(wait))
 	}
+	// wait 跃迁检测：首次非零 engaged、归零 released；其余变化仍为 DEBUG
+	// 逐次明细，不进跃迁与回调。
+	var tr Transition
+	hasTr := false
+	switch {
+	case from == 0 && wait > 0:
+		driver, driverP := g.dominantLocked(cfg.clock.Now())
+		tr = Transition{Kind: TransitionWaitEngaged, From: 0, To: seconds(wait),
+			Driver: driver, DriverPressure: driverP}
+		hasTr = true
+	case from > 0 && wait == 0:
+		driver, driverP := g.dominantLocked(cfg.clock.Now())
+		tr = Transition{Kind: TransitionWaitReleased, From: seconds(from), To: 0,
+			Driver: driver, DriverPressure: driverP}
+		hasTr = true
+	}
 	g.mu.Unlock()
 	if changed {
 		g.logger.debug("governor: wait changed",
 			slogAttrFloat("from_seconds", seconds(from)),
 			slogAttrFloat("to_seconds", seconds(wait)))
+	}
+	if hasTr {
+		g.logWaitTransition(tr, alpha)
+		g.fireTransition(tr)
 	}
 	if ctx.Err() == nil {
 		cfg.clock.Sleep(ctx, wait)
@@ -269,8 +293,11 @@ func (d *Decision) Record(err error) {
 	for _, s := range g.signals {
 		s.Observe(now, outcome, took)
 	}
-	g.recomputeLocked(now)
+	tr, hasTr := g.recomputeLocked(now)
 	g.mu.Unlock()
+	if hasTr {
+		g.fireTransition(tr)
+	}
 }
 
 // ---- 内部 ----
@@ -326,7 +353,12 @@ func (g *Governor) dominantLocked(now time.Time) (name string, pressure float64)
 }
 
 // recomputeLocked 在反馈后重算 α 并处理仪表与跃迁日志，须持有 g.mu。
-func (g *Governor) recomputeLocked(now time.Time) {
+// 检测到的 α 跃迁随第二返回值返回（无跃迁为 false），由调用方在锁外经
+// fireTransition 派发——用户代码不得在持锁段执行。跃迁日志本身是内部
+// Logger 输出，仍在持锁段内执行（Logger 须快速返回；移出锁外的仅用户回调）。
+// Kind 判定沿用既有 switch 优先级：α 从 <0.5 直接越过 0.9 时只记
+// suppression_started。
+func (g *Governor) recomputeLocked(now time.Time) (Transition, bool) {
 	s := g.pressureLocked(now)
 	a := SuppressionFactor(s, g.cfg.Load().c)
 	prev := g.alpha
@@ -336,25 +368,63 @@ func (g *Governor) recomputeLocked(now time.Time) {
 	g.metrics.suppression.Set(a)
 
 	driver, driverP := g.dominantLocked(now)
+	var kind TransitionKind
 	switch {
 	case prev <= 0.5 && a > 0.5:
+		kind = TransitionSuppressionStarted
 		g.logger.warn("governor: suppression started (alpha went above 0.5)",
 			slogAttrFloat("pressure", s),
 			slogAttrFloat("suppression", a),
 			slogAttrString("driver_signal", driver),
 			slogAttrFloat("driver_pressure", driverP))
 	case prev <= 0.9 && a > 0.9:
+		kind = TransitionDeepSuppression
 		g.logger.warn("governor: deep suppression (alpha went above 0.9)",
 			slogAttrFloat("pressure", s),
 			slogAttrFloat("suppression", a),
 			slogAttrString("driver_signal", driver),
 			slogAttrFloat("driver_pressure", driverP))
 	case prev > 0 && a == 0:
+		kind = TransitionSuppressionStopped
 		g.logger.info("governor: suppression stopped (alpha reached 0)",
 			slogAttrFloat("pressure", s),
 			slogAttrFloat("suppression", a),
 			slogAttrString("driver_signal", driver),
 			slogAttrFloat("driver_pressure", driverP))
+	default:
+		return Transition{}, false
+	}
+	return Transition{Kind: kind, From: prev, To: a,
+		Driver: driver, DriverPressure: driverP}, true
+}
+
+// fireTransition 在锁外同步派发跃迁事件：跃迁判定在锁内完成，用户代码移出
+// 持锁段（慢回调不得阻塞热路径）；panic 一律 recover，回调故障不外溢。
+// 未配置回调时零成本（一次原子读）。
+func (g *Governor) fireTransition(tr Transition) {
+	fn := g.cfg.Load().onTransition
+	if fn == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	fn(tr)
+}
+
+// logWaitTransition 输出 wait 生效/解除跃迁日志——与 α 路径对称的低频 INFO，
+// 补齐延迟执行生效期在 Info 安静模式下的可见性（wait 逐次变化仍为 DEBUG）。
+func (g *Governor) logWaitTransition(tr Transition, alpha float64) {
+	switch tr.Kind {
+	case TransitionWaitEngaged:
+		g.logger.info("governor: wait engaged (wait went above 0)",
+			slogAttrFloat("wait_seconds", tr.To),
+			slogAttrFloat("suppression", alpha),
+			slogAttrString("driver_signal", tr.Driver),
+			slogAttrFloat("driver_pressure", tr.DriverPressure))
+	case TransitionWaitReleased:
+		g.logger.info("governor: wait released (wait reached 0)",
+			slogAttrFloat("suppression", alpha),
+			slogAttrString("driver_signal", tr.Driver),
+			slogAttrFloat("driver_pressure", tr.DriverPressure))
 	}
 }
 

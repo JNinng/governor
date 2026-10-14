@@ -619,3 +619,60 @@ func TestStreamWiresConcurrencySignal(t *testing.T) {
 	waitUntil(t, 5*time.Second, func() bool { return conc.InFlight() == 0 },
 		"流结束（io.EOF）后在途计数应归零")
 }
+
+// ---- OnTransition 透传 ----
+
+type transitionEntry struct {
+	key string
+	tr  governor.Transition
+}
+
+type transitionCollector struct {
+	mu      sync.Mutex
+	entries []transitionEntry
+}
+
+func (c *transitionCollector) record(target string, tr governor.Transition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = append(c.entries, transitionEntry{key: target, tr: tr})
+}
+
+func (c *transitionCollector) snapshot() []transitionEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]transitionEntry(nil), c.entries...)
+}
+
+func TestUnaryOnTransition(t *testing.T) {
+	c := &transitionCollector{}
+	ix, err := New(
+		WithSignalFactory(tightRejectionSignals),
+		WithSensitivity(0.5),
+		WithOnTransition(c.record),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cc := newConn(t, "a.example:1")
+	inv := &countingInvoker{err: status.Error(codes.ResourceExhausted, "overloaded")}
+	unary := ix.Unary()
+	for i := 0; i < 100; i++ {
+		_ = unary(context.Background(), "/pkg.Svc/Method", struct{}{}, struct{}{}, cc, inv.invoke)
+	}
+	entries := c.snapshot()
+	if len(entries) == 0 {
+		t.Fatalf("持续失败应产生跃迁事件")
+	}
+	for _, e := range entries {
+		if e.key != cc.Target() {
+			t.Fatalf("回调 key = %q, want %q", e.key, cc.Target())
+		}
+		if e.tr.Kind != governor.TransitionSuppressionStarted {
+			t.Fatalf("kind = %v, want suppression_started", e.tr.Kind)
+		}
+	}
+	if _, err := New(WithOnTransition(nil)); err == nil {
+		t.Fatalf("nil 回调应报错")
+	}
+}

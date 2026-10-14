@@ -55,15 +55,16 @@ type hostEntry struct {
 type Transport struct {
 	base http.RoundTripper
 
-	mu         sync.RWMutex
-	hosts      map[string]*hostEntry
-	prefixes   map[string]string // 规整后的指标前缀 → host，创建时检测碰撞
-	newSignals func() ([]governor.Signal, error)
-	classify   func(resp *http.Response, err error) governor.Outcome
-	prefix     func(host string) string
-	meter      observ.Meter
-	sensitiv   *float64
-	probeRatio *float64
+	mu           sync.RWMutex
+	hosts        map[string]*hostEntry
+	prefixes     map[string]string // 规整后的指标前缀 → host，创建时检测碰撞
+	newSignals   func() ([]governor.Signal, error)
+	classify     func(resp *http.Response, err error) governor.Outcome
+	prefix       func(host string) string
+	meter        observ.Meter
+	sensitiv     *float64
+	probeRatio   *float64
+	onTransition func(host string, tr governor.Transition)
 }
 
 // New 创建适配器。base 为 nil 时使用 http.DefaultTransport；
@@ -222,6 +223,19 @@ func WithMeter(m observ.Meter) Option {
 	}
 }
 
+// WithOnTransition 注入状态跃迁回调：各 host 实例的跃迁按 host 归因后转发，
+// 语义同 governor.WithOnTransition（构造期固定、锁外同步派发、panic 一律
+// recover、只推低频跃迁）。nil 报错。
+func WithOnTransition(fn func(host string, tr governor.Transition)) Option {
+	return func(t *Transport) error {
+		if fn == nil {
+			return fmt.Errorf("governor/httpx: on-transition callback must not be nil")
+		}
+		t.onTransition = fn
+		return nil
+	}
+}
+
 // ---- 内部 ----
 
 // 分类结果到 Record 输入的桥接：Record 只接收 error，成功传 nil、忽略与失败传
@@ -359,6 +373,11 @@ func (t *Transport) build(host, prefix string) (*hostEntry, error) {
 	}
 	if t.probeRatio != nil {
 		opts = append(opts, governor.WithProbeRatio(*t.probeRatio))
+	}
+	if t.onTransition != nil {
+		opts = append(opts, governor.WithOnTransition(func(tr governor.Transition) {
+			t.onTransition(host, tr)
+		}))
 	}
 	g, err := governor.New(opts...)
 	if err != nil {

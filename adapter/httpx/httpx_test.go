@@ -607,3 +607,71 @@ func TestRoundTripperBypassNotCounted(t *testing.T) {
 	}
 	close(release)
 }
+
+// ---- OnTransition 透传 ----
+
+type transitionEntry struct {
+	key string
+	tr  governor.Transition
+}
+
+type transitionCollector struct {
+	mu      sync.Mutex
+	entries []transitionEntry
+}
+
+func (c *transitionCollector) record(host string, tr governor.Transition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = append(c.entries, transitionEntry{key: host, tr: tr})
+}
+
+func (c *transitionCollector) snapshot() []transitionEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]transitionEntry(nil), c.entries...)
+}
+
+func TestRoundTripperOnTransition(t *testing.T) {
+	c := &transitionCollector{}
+	var hits atomic.Int64
+	srv := statusServer(http.StatusTooManyRequests, &hits)
+	defer srv.Close()
+	tr, err := New(nil,
+		WithSignalFactory(tightRejectionSignals),
+		WithSensitivity(0.5),
+		WithOnTransition(c.record),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client := &http.Client{Transport: tr}
+	for i := 0; i < 100; i++ {
+		resp, err := client.Get(srv.URL)
+		if errors.Is(err, governor.ErrSuppressed) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("第%d次请求: %v", i+1, err)
+		}
+		resp.Body.Close()
+	}
+	entries := c.snapshot()
+	if len(entries) == 0 {
+		t.Fatalf("持续失败应产生跃迁事件")
+	}
+	for _, e := range entries {
+		if e.key != hostOf(srv.URL) {
+			t.Fatalf("回调 key = %q, want %q", e.key, hostOf(srv.URL))
+		}
+		if e.tr.Kind != governor.TransitionSuppressionStarted {
+			t.Fatalf("kind = %v, want suppression_started", e.tr.Kind)
+		}
+	}
+}
+
+func TestOnTransitionNilRejected(t *testing.T) {
+	if _, err := New(nil, WithOnTransition(nil)); err == nil {
+		t.Fatalf("nil 回调应报错")
+	}
+}

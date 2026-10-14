@@ -212,9 +212,9 @@ for {
 完整示例：`go run ./example/wait`（[example/wait/main.go](example/wait/main.go)）。
 场景是后台同步任务，下游依次经历 600ms、1100ms、200ms 三档耗时（目标 500ms）：
 等待随压力上升，下游恢复后一两次采样即归零，12 次执行全部发出、无一被丢弃。
-日志与 http 示例相同，Info 阈值下只出状态跃迁（`WARN suppression started` /
-`INFO suppression stopped`），`wait changed` 明细为 Debug 级，排查时把 Level
-调到 Debug 即可看到：
+日志与 http 示例相同，Info 阈值下只出低频状态跃迁（`INFO wait engaged` /
+`WARN suppression started` / `INFO suppression stopped` / `INFO wait released`），
+`wait changed` 明细为 Debug 级，排查时把 Level 调到 Debug 即可看到：
 
 ```text
 第  4 次  等待  334ms │ 执行 1100ms │ α=0.44
@@ -336,6 +336,37 @@ for _, snap := range g.Signals() {
 }
 if s > 2 { /* 业务侧切只读模式等，观测不是控制 */ }
 ```
+
+## 状态跃迁回调（OnTransition）
+
+跃迁目前只走日志；接告警 / webhook 用 `WithOnTransition` 类型化回调
+（构造期固定，`Update` 拒绝更换），不再解析日志文本。跃迁在锁内判定、**锁外同步
+派发**——回调慢只拖慢触发它的那次调用，不阻塞其他请求，但仍须快速返回；
+panic 一律 recover。只推跃迁（低频），DEBUG 级 wait/batch 逐次变化不进回调；
+并发触发时回调间不保证全局到达顺序（锁内日志有序），顺序以事件的 From/To 为准。
+
+```go
+g, _ := governor.New(
+    governor.WithSignals(lat, rej),
+    governor.WithOnTransition(func(tr governor.Transition) {
+        switch tr.Kind {
+        case governor.TransitionSuppressionStarted:
+            alert(fmt.Sprintf("抑制开始 α=%.2f driver=%s/%.2f", tr.To, tr.Driver, tr.DriverPressure))
+        case governor.TransitionWaitEngaged:
+            alert(fmt.Sprintf("延迟执行生效 wait=%.1fs driver=%s", tr.To, tr.Driver))
+        }
+    }),
+)
+```
+
+`Transition{Kind, From, To, Driver, DriverPressure}`：Kind 覆盖
+suppression_started / deep_suppression / suppression_stopped（From/To 为 α）、
+wait_engaged / wait_released（From/To 为等待秒数）；Driver 为压力最大的信号名。
+**Kind 判定沿用既有优先级**：α 从 <0.5 直接跳过 0.9 时只发 suppression_started、
+不发 deep_suppression——快速爬坡会跳过 deep 事件。跃迁由反馈路径触发（α 三档经
+`Record`，wait 两态经 `Wait`），与对应日志同源同频。回调里做告警/webhook 可以，
+改变配置不行（观测不是控制）。经[传输层适配器](#传输层适配器)接入时，用适配器的
+`WithOnTransition`（首参为 host / target）接收各下游实例的跃迁。
 
 ## 感知/决策组件单独复用
 

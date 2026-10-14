@@ -11,7 +11,11 @@
 //   - stream：建流成功即放行，以流结束为一操作——RecvMsg 返回 io.EOF 记成功，
 //     其余错误（含 SendMsg 因传输写失败返回的 io.EOF，grpc 契约允许）按分类记录；
 //     业务未读完流即弃用则不记录（与两段式不 Record 同语义）；
-//   - 请求级旁路：ctx 带 WithoutSuppression 标记的调用完全绕过抑制与反馈。
+//   - 请求级旁路：ctx 带 WithoutSuppression 标记的调用完全绕过抑制与反馈；
+//   - 信号集合中的 governor.ConcurrencySignal 由拦截器自动配对计数：
+//     放行后 Enter、调用返回 / 流结束后 Leave，本地丢弃不计入（同 desc.md §3.1），
+//     旁路调用不参与；stream 以流结束为离开点，未读完即弃用的流不会离开，
+//     计数持续抬升——须保证流被读完或以错误终结。
 //
 // 默认结局分类：ResourceExhausted / Unavailable（429/503 的等价码）与
 // DeadlineExceeded（超时 ≈ 下游变慢）记为失败；Canceled（调用方取消）不计入；
@@ -50,11 +54,18 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// targetEntry 是单个 target 的实例与其在途计数信号（ConcurrencySignal 自动接线的
+// 对象）。
+type targetEntry struct {
+	gov  *governor.Governor
+	conc []*governor.ConcurrencySignal
+}
+
 // Interceptor 持有按 target 惰性创建的 Governor 注册表：Unary 与 Stream 共用。
 // 并发安全；多连接共享同一实例。
 type Interceptor struct {
 	mu         sync.RWMutex
-	governors  map[string]*governor.Governor
+	targets    map[string]*targetEntry
 	prefixes   map[string]string // 规整后的指标前缀 → target，创建时检测碰撞
 	newSignals func() ([]governor.Signal, error)
 	classify   func(err error) governor.Outcome
@@ -68,7 +79,7 @@ type Interceptor struct {
 // 半成品）。
 func New(opts ...Option) (*Interceptor, error) {
 	ix := &Interceptor{
-		governors:  make(map[string]*governor.Governor),
+		targets:    make(map[string]*targetEntry),
 		prefixes:   make(map[string]string),
 		newSignals: defaultSignals,
 		classify:   defaultClassify,
@@ -89,13 +100,24 @@ func (ix *Interceptor) Unary() grpc.UnaryClientInterceptor {
 		if bypassed(ctx) {
 			return invoker(ctx, method, req, reply, cc, opts...)
 		}
-		g, err := ix.governorFor(cc.Target())
+		h, err := ix.targetFor(cc.Target())
 		if err != nil {
 			return err
 		}
-		dec := g.Allow()
+		dec := h.gov.Allow()
 		if !dec.Allowed() {
-			return governor.ErrSuppressed
+			return governor.ErrSuppressed // 本地丢弃：不入在途计数
+		}
+		if len(h.conc) > 0 {
+			for _, cs := range h.conc {
+				cs.Enter()
+			}
+			// defer 保证 panic 路径也离开；先于返回值生效无关紧要（只做计数）。
+			defer func() {
+				for _, cs := range h.conc {
+					cs.Leave()
+				}
+			}()
 		}
 		invokeErr := invoker(ctx, method, req, reply, cc, opts...)
 		dec.Record(ix.recordInput(invokeErr))
@@ -104,7 +126,7 @@ func (ix *Interceptor) Unary() grpc.UnaryClientInterceptor {
 }
 
 // Stream 返回 stream client interceptor。以流结束为一操作：RecvMsg 返回 io.EOF
-// 记成功，任一方向出错按分类记录；业务未读完流即弃用则不记录。
+// 记成功，任一方向出错按分类记录；业务未读完流即弃用则不记录、在途计数不离开。
 func (ix *Interceptor) Stream() grpc.StreamClientInterceptor {
 	return func(ctx context.Context, desc *grpc.StreamDesc,
 		cc *grpc.ClientConn, method string, streamer grpc.Streamer,
@@ -112,22 +134,29 @@ func (ix *Interceptor) Stream() grpc.StreamClientInterceptor {
 		if bypassed(ctx) {
 			return streamer(ctx, desc, cc, method, opts...)
 		}
-		g, err := ix.governorFor(cc.Target())
+		h, err := ix.targetFor(cc.Target())
 		if err != nil {
 			return nil, err
 		}
-		dec := g.Allow()
+		dec := h.gov.Allow()
 		if !dec.Allowed() {
-			return nil, governor.ErrSuppressed
+			return nil, governor.ErrSuppressed // 本地丢弃：不入在途计数
 		}
 		cs, err := streamer(ctx, desc, cc, method, opts...)
 		if err != nil {
 			dec.Record(ix.recordInput(err))
 			return nil, err
 		}
+		for _, cs2 := range h.conc {
+			cs2.Enter()
+		}
 		return &recordingStream{
 			ClientStream: cs,
 			finish: func(done error, fromRecv bool) {
+				// 流结束 = 在途离开；未读完即弃用的流不经过此处（见包文档）。
+				for _, cs2 := range h.conc {
+					cs2.Leave()
+				}
 				if fromRecv && errors.Is(done, io.EOF) {
 					dec.Record(nil) // RecvMsg 的 io.EOF：流正常读完，记成功
 					return
@@ -142,7 +171,11 @@ func (ix *Interceptor) Stream() grpc.StreamClientInterceptor {
 // 表），供业务查询只读状态（Pressure / Suppression / Signals，观测非控制）。
 // 构造失败时返回错误且不缓存。
 func (ix *Interceptor) Governor(target string) (*governor.Governor, error) {
-	return ix.governorFor(target)
+	h, err := ix.targetFor(target)
+	if err != nil {
+		return nil, err
+	}
+	return h.gov, nil
 }
 
 // WithoutSuppression 标记该 ctx 上的调用完全绕过抑制与反馈：
@@ -316,20 +349,20 @@ func sanitize(s string) string {
 	return string(b)
 }
 
-// governorFor 返回 target 对应的 Governor，惰性创建；构造失败返回错误且不缓存。
+// targetFor 返回 target 对应的实例，惰性创建；构造失败返回错误且不缓存。
 // 双重检查：读锁命中直返，未命中升级写锁后再查一次（并发首访同一 target 只构造
 // 一次）。不同 target 规整后产生相同指标前缀时报错（如 "a.b:1" 与 "a_b:1"）。
-func (ix *Interceptor) governorFor(target string) (*governor.Governor, error) {
+func (ix *Interceptor) targetFor(target string) (*targetEntry, error) {
 	ix.mu.RLock()
-	g, ok := ix.governors[target]
+	h, ok := ix.targets[target]
 	ix.mu.RUnlock()
 	if ok {
-		return g, nil
+		return h, nil
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	if g, ok := ix.governors[target]; ok {
-		return g, nil
+	if h, ok := ix.targets[target]; ok {
+		return h, nil
 	}
 	prefix := ix.prefix(target)
 	if existing, ok := ix.prefixes[prefix]; ok {
@@ -338,19 +371,26 @@ func (ix *Interceptor) governorFor(target string) (*governor.Governor, error) {
 			"governor/grpcx: metric prefix %q of target %q collides with target %q; targets must be unique after prefix sanitization (see WithMetricPrefix)",
 			prefix, target, existing)
 	}
-	g, err := ix.build(target, prefix)
+	h, err := ix.build(target, prefix)
 	if err != nil {
 		return nil, err
 	}
-	ix.governors[target] = g
+	ix.targets[target] = h
 	ix.prefixes[prefix] = target
-	return g, nil
+	return h, nil
 }
 
-func (ix *Interceptor) build(target, prefix string) (*governor.Governor, error) {
+func (ix *Interceptor) build(target, prefix string) (*targetEntry, error) {
 	sigs, err := ix.newSignals()
 	if err != nil {
 		return nil, fmt.Errorf("governor/grpcx: build signals for target %q: %w", target, err)
+	}
+	// 在途计数信号由拦截器自动接线：放行后 Enter、调用返回 / 流结束后 Leave。
+	var conc []*governor.ConcurrencySignal
+	for _, sig := range sigs {
+		if cs, ok := sig.(*governor.ConcurrencySignal); ok {
+			conc = append(conc, cs)
+		}
 	}
 	opts := []governor.Option{
 		governor.WithSignals(sigs...),
@@ -370,7 +410,7 @@ func (ix *Interceptor) build(target, prefix string) (*governor.Governor, error) 
 	if err != nil {
 		return nil, fmt.Errorf("governor/grpcx: build governor for target %q: %w", target, err)
 	}
-	return g, nil
+	return &targetEntry{gov: g, conc: conc}, nil
 }
 
 // recordingStream 包装 ClientStream，把流结束作为一次操作记录（只记首个终态）：

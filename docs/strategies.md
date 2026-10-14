@@ -179,6 +179,11 @@ for {
 | `LatencySignal` | `WithLatencyTarget`（L_target） | 200ms | > 0 | 压力=0的分界线；调大对变慢更宽容，调小更早感知劣化 |
 | `LatencySignal` | `WithLatencyBeta`（β） | 0.4 | (0, 1)，建议 0.3~0.5 | EWMA 平滑系数；调大更平滑，调小跟手但易抖动 |
 | `LatencySignal` | `WithLatencyWindow` | 90s | > 0 | 采样饥饿阈值；窗口内无新采样时沿用上一次计算出的压力 |
+| `ConcurrencySignal` | `WithConcurrencyTarget`（N_target） | 100 | > 0 | 压力=0的分界线：n ≤ N_target 恒不抑制，超出线性升压（n = 2×N_target 时 S=1）；按下游并发容量设定 |
+
+`ConcurrencySignal` 以 `Enter`/`Leave` 显式配对计数（在途 / 队列深度），不参与
+上述窗口与饥饿语义：计数恒反映当前状态，不随时间衰减；经传输层适配器使用时
+由适配器自动配对（放行后起算，本地丢弃不计入）。
 
 ## 参数总表
 
@@ -193,3 +198,4 @@ for {
 | `WithLatencyTarget` | LatencySignal | 200ms | > 0 | ❌（构造期） |
 | `WithLatencyBeta` | LatencySignal | 0.4 | (0, 1) | ❌（构造期） |
 | `WithLatencyWindow` | LatencySignal | 90s | > 0 | ❌（构造期） |
+| `WithConcurrencyTarget` | ConcurrencySignal | 100 | > 0 | ❌（构造期） |

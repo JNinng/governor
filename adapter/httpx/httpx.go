@@ -8,7 +8,10 @@
 //     调用方取消为忽略、其余为成功），耗时自 Allow 起算，与 Do 一致；
 //   - 请求级旁路：ctx 带 WithoutSuppression 标记的请求完全绕过抑制与反馈，
 //     不做 Allow 判定（不会 ErrSuppressed）、不 Record（不进任何统计），
-//     适用于 health check 等不参与抑制的调用。
+//     适用于 health check 等不参与抑制的调用；
+//   - 信号集合中的 governor.ConcurrencySignal 由适配器自动配对计数：
+//     放行后 Enter、Record 后 Leave，本地丢弃不计入（同 desc.md §3.1），
+//     旁路请求不参与。
 //
 // 口径边界：成败记录止步于 RoundTrip——响应体读取阶段的失败（截断、解码错误）
 // 发生在 Record 之后，不进反馈；需要体级成败口径的业务改用 governor.Do / 两段式。
@@ -40,6 +43,12 @@ import (
 	"github.com/jninng/observ"
 )
 
+// hostEntry 是单个 host 的实例与其在途计数信号（ConcurrencySignal 自动接线的对象）。
+type hostEntry struct {
+	gov  *governor.Governor
+	conc []*governor.ConcurrencySignal
+}
+
 // Transport 是 http.RoundTripper 包装：按 host 惰性创建 Governor（首个请求时构造，
 // 失败不缓存、下次请求重试），放行的请求结束后自动 Record。
 // 并发安全；多请求共享同一实例（http.Client.Transport 即此用法）。
@@ -47,7 +56,7 @@ type Transport struct {
 	base http.RoundTripper
 
 	mu         sync.RWMutex
-	governors  map[string]*governor.Governor
+	hosts      map[string]*hostEntry
 	prefixes   map[string]string // 规整后的指标前缀 → host，创建时检测碰撞
 	newSignals func() ([]governor.Signal, error)
 	classify   func(resp *http.Response, err error) governor.Outcome
@@ -62,7 +71,7 @@ type Transport struct {
 func New(base http.RoundTripper, opts ...Option) (*Transport, error) {
 	t := &Transport{
 		base:       base,
-		governors:  make(map[string]*governor.Governor),
+		hosts:      make(map[string]*hostEntry),
 		prefixes:   make(map[string]string),
 		newSignals: defaultSignals,
 		classify:   defaultClassify,
@@ -84,13 +93,24 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if bypassed(req.Context()) {
 		return t.base.RoundTrip(req)
 	}
-	g, err := t.governorFor(req.URL.Host)
+	h, err := t.hostFor(req.URL.Host)
 	if err != nil {
 		return nil, err
 	}
-	dec := g.Allow()
+	dec := h.gov.Allow()
 	if !dec.Allowed() {
-		return nil, governor.ErrSuppressed
+		return nil, governor.ErrSuppressed // 本地丢弃：不入在途计数
+	}
+	if len(h.conc) > 0 {
+		for _, cs := range h.conc {
+			cs.Enter()
+		}
+		// defer 保证 panic 路径也离开；先于返回值生效无关紧要（只做计数）。
+		defer func() {
+			for _, cs := range h.conc {
+				cs.Leave()
+			}
+		}()
 	}
 	resp, err := t.base.RoundTrip(req)
 	dec.Record(t.recordInput(resp, err))
@@ -101,7 +121,11 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 // 供业务查询只读状态（Pressure / Suppression / Signals，观测非控制）。
 // 构造失败时返回错误且不缓存。
 func (t *Transport) Governor(host string) (*governor.Governor, error) {
-	return t.governorFor(host)
+	h, err := t.hostFor(host)
+	if err != nil {
+		return nil, err
+	}
+	return h.gov, nil
 }
 
 // WithoutSuppression 标记该 ctx 上的请求完全绕过抑制与反馈：
@@ -279,20 +303,20 @@ func sanitize(s string) string {
 	return string(b)
 }
 
-// governorFor 返回 host 对应的 Governor，惰性创建；构造失败返回错误且不缓存。
+// hostFor 返回 host 对应的实例，惰性创建；构造失败返回错误且不缓存。
 // 双重检查：读锁命中直返，未命中升级写锁后再查一次（并发首访同一 host 只构造
 // 一次）。不同 host 规整后产生相同指标前缀时报错（如 "a.b:80" 与 "a_b:80"）。
-func (t *Transport) governorFor(host string) (*governor.Governor, error) {
+func (t *Transport) hostFor(host string) (*hostEntry, error) {
 	t.mu.RLock()
-	g, ok := t.governors[host]
+	h, ok := t.hosts[host]
 	t.mu.RUnlock()
 	if ok {
-		return g, nil
+		return h, nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if g, ok := t.governors[host]; ok {
-		return g, nil
+	if h, ok := t.hosts[host]; ok {
+		return h, nil
 	}
 	prefix := t.prefix(host)
 	if existing, ok := t.prefixes[prefix]; ok {
@@ -301,19 +325,26 @@ func (t *Transport) governorFor(host string) (*governor.Governor, error) {
 			"governor/httpx: metric prefix %q of host %q collides with host %q; hosts must be unique after prefix sanitization (see WithMetricPrefix)",
 			prefix, host, existing)
 	}
-	g, err := t.build(host, prefix)
+	h, err := t.build(host, prefix)
 	if err != nil {
 		return nil, err
 	}
-	t.governors[host] = g
+	t.hosts[host] = h
 	t.prefixes[prefix] = host
-	return g, nil
+	return h, nil
 }
 
-func (t *Transport) build(host, prefix string) (*governor.Governor, error) {
+func (t *Transport) build(host, prefix string) (*hostEntry, error) {
 	sigs, err := t.newSignals()
 	if err != nil {
 		return nil, fmt.Errorf("governor/httpx: build signals for host %q: %w", host, err)
+	}
+	// 在途计数信号由适配器自动接线：放行后 Enter、Record 后 Leave。
+	var conc []*governor.ConcurrencySignal
+	for _, sig := range sigs {
+		if cs, ok := sig.(*governor.ConcurrencySignal); ok {
+			conc = append(conc, cs)
+		}
 	}
 	opts := []governor.Option{
 		governor.WithSignals(sigs...),
@@ -333,5 +364,5 @@ func (t *Transport) build(host, prefix string) (*governor.Governor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("governor/httpx: build governor for host %q: %w", host, err)
 	}
-	return g, nil
+	return &hostEntry{gov: g, conc: conc}, nil
 }

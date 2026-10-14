@@ -239,8 +239,9 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 |---|---|---|---|
 | `RejectionSignal`（场景 A） | 滑窗失败率超 1/K | 下游**显式拒绝**：HTTP 429/503、RPC 错误 | `WithRejectionK` 2.0（容忍 50% 失败）、`WithRejectionWindow` 90s |
 | `LatencySignal`（场景 B） | EWMA 耗时超目标值 | 下游**变慢但不报错**：P99 劣化、写入堆积 | `WithLatencyTarget` 200ms、`WithLatencyBeta` 0.4、`WithLatencyWindow` 90s |
+| `ConcurrencySignal`（内置） | 在途 / 队列深度超 N_target | **本地过载**：在途打满、队列堆积 | `WithConcurrencyTarget` 100 |
 | 两者组合 | 取最差值，任一维度过载即抑制 | 错误与变慢互为前兆（推荐默认） | — |
-| 自定义 `Signal` | 任意口径（队列深度、在途请求数…） | 内置两类的口径都不合适 | 实现 `Name/Observe/Pressure` 三方法 |
+| 自定义 `Signal` | 任意口径 | 内置三类的口径都不合适 | 实现 `Name/Observe/Pressure` 三方法 |
 
 ### 参数往哪调
 
@@ -274,6 +275,7 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 ```text
 拒绝信号  S_rej = max(0, (N_total − K·N_success) / (N_total + 1))   成功率高于 1/K 时恒 0
 延迟信号  S_lat = max(0, (L_ewma − L_target) / L_target)            延迟低于目标时恒 0
+并发信号  S_con = max(0, (n − N_target) / N_target)                 n ≤ N_target 时恒 0
 多信号    S     = max(S_1, …, S_n)                                 最差信号优先
 抑制因子  α     = clamp(S / (S + C), 0, 1)                          S=C 时 α=0.5，渐近 1 不达 1
 ```
@@ -300,6 +302,30 @@ g, _ := governor.New(
 )
 ```
 
+### 在途 / 队列深度信号（ConcurrencySignal）
+
+本地过载（在途打满、队列堆积）已内置信号：超出 N_target 线性升压
+（n = 2×N_target 时 S=1），与延迟 / 拒绝信号经 `max` 合成，无需自定义。
+`Signal` 接口没有"操作开始"事件，故该信号在 `Name/Observe/Pressure` 之外另暴露
+`Enter`/`Leave` 显式计数（`Observe` 为空实现，`Record` 反馈不改变计数）：
+
+```go
+conc, _ := governor.NewConcurrencySignal(
+    governor.WithConcurrencyTarget(200), // 压力 0 的分界线，按下游并发容量设定
+)
+g, _ := governor.New(governor.WithSignals(lat, rej, conc))
+
+// 队列深度口径：入队处 Enter、出队/完成处 Leave（建议 defer 配对）
+conc.Enter()
+defer conc.Leave()
+```
+
+在途请求数口径：放行后 `Enter`、完成后 `Leave`，本地丢弃不计入（同 desc.md §3.1）。
+经[传输层适配器](#传输层适配器)使用时由适配器**自动配对**——信号集合中的
+`ConcurrencySignal` 无需业务干预；流式 RPC 以流结束为离开点，未读完即弃用的流
+不会离开（计数持续抬升），须保证流被读完或以错误终结。计数不随时间衰减，
+未配对的 `Enter` 会永久抬高压力，务必配对。
+
 ## 业务自定义决策（只读暴露）
 
 ```go
@@ -321,9 +347,11 @@ s := sig.Pressure(time.Now())
 alpha := governor.SuppressionFactor(s, 1.0) // 纯函数：clamp(s/(s+c), 0, 1)
 ```
 
-实现 `Signal` 接口（`Name/Observe/Pressure`）即可接入自定义信号（如基于队列深度）。
-`Pressure` 为只读观测；两类内置信号在统计饥饿（窗口/阈值内无新样本）时沿用
-上一次计算出的压力，从未有样本时返回 0。
+实现 `Signal` 接口（`Name/Observe/Pressure`）即可接入自定义信号；在途请求数 /
+队列深度已内置（`ConcurrencySignal`，见上文）。
+`Pressure` 为只读观测；`RejectionSignal` / `LatencySignal` 在统计饥饿（窗口/阈值内
+无新样本）时沿用上一次计算出的压力，从未有样本时返回 0；`ConcurrencySignal`
+的计数恒反映当前状态，不随时间衰减。
 
 ### 信号与决策的进阶配置
 

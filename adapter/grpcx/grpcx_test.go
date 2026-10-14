@@ -534,3 +534,88 @@ func TestPrefixCollisionBetweenTargets(t *testing.T) {
 		t.Fatalf("已有 target 应正常复用: %v", err)
 	}
 }
+
+// ---- ConcurrencySignal 自动接线 ----
+
+// waitUntil 轮询等待条件成立，超时 Fatal（用于在途计数的跨协程同步）。
+func waitUntil(t *testing.T, d time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal(msg)
+}
+
+type gatedInvoker struct {
+	release chan struct{}
+}
+
+func (g *gatedInvoker) invoke(ctx context.Context, method string, req, reply any,
+	cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+	<-g.release
+	return nil
+}
+
+func TestUnaryWiresConcurrencySignal(t *testing.T) {
+	conc, err := governor.NewConcurrencySignal(governor.WithConcurrencyTarget(10))
+	if err != nil {
+		t.Fatalf("NewConcurrencySignal: %v", err)
+	}
+	ix, err := New(WithSignalFactory(fixedSignals(conc)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cc := newConn(t, "a.example:1")
+	inv := &gatedInvoker{release: make(chan struct{})}
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		go func() {
+			_ = ix.Unary()(context.Background(), "/pkg.Svc/Method", struct{}{}, struct{}{}, cc, inv.invoke)
+		}()
+	}
+	waitUntil(t, 5*time.Second, func() bool { return conc.InFlight() == n },
+		"在途调用应把计数抬升到 5")
+	close(inv.release)
+	waitUntil(t, 5*time.Second, func() bool { return conc.InFlight() == 0 },
+		"调用完成后在途计数应归零")
+}
+
+type gatedStream struct {
+	grpc.ClientStream
+	release chan struct{}
+}
+
+func (g *gatedStream) RecvMsg(any) error {
+	<-g.release
+	return io.EOF
+}
+
+func TestStreamWiresConcurrencySignal(t *testing.T) {
+	conc, err := governor.NewConcurrencySignal(governor.WithConcurrencyTarget(10))
+	if err != nil {
+		t.Fatalf("NewConcurrencySignal: %v", err)
+	}
+	ix, err := New(WithSignalFactory(fixedSignals(conc)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cc := newConn(t, "a.example:1")
+	st := &countingStreamer{cs: &gatedStream{release: make(chan struct{})}}
+
+	cs, err := ix.Stream()(context.Background(), &grpc.StreamDesc{ServerStreams: true},
+		cc, "/pkg.Svc/Method", st.stream)
+	if err != nil {
+		t.Fatalf("建流: %v", err)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return conc.InFlight() == 1 },
+		"未结束的流应计为在途")
+	go func() { _ = cs.RecvMsg(struct{}{}) }()
+	close(st.cs.(*gatedStream).release)
+	waitUntil(t, 5*time.Second, func() bool { return conc.InFlight() == 0 },
+		"流结束（io.EOF）后在途计数应归零")
+}

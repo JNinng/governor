@@ -512,3 +512,98 @@ func TestPrefixCollisionBetweenHosts(t *testing.T) {
 		t.Fatalf("已有 host 应正常复用: %v", err)
 	}
 }
+
+// ---- ConcurrencySignal 自动接线 ----
+
+// waitUntil 轮询等待条件成立，超时 Fatal（用于在途计数的跨协程同步）。
+func waitUntil(t *testing.T, d time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal(msg)
+}
+
+func TestRoundTripperWiresConcurrencySignal(t *testing.T) {
+	conc, err := governor.NewConcurrencySignal(governor.WithConcurrencyTarget(10))
+	if err != nil {
+		t.Fatalf("NewConcurrencySignal: %v", err)
+	}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	tr, err := New(nil, WithSignalFactory(func() ([]governor.Signal, error) {
+		return []governor.Signal{conc}, nil
+	}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client := &http.Client{Transport: tr}
+
+	const n = 5
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := client.Get(srv.URL)
+			if err != nil {
+				t.Errorf("请求失败: %v", err)
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	waitUntil(t, 5*time.Second, func() bool { return conc.InFlight() == n },
+		"在途请求应把计数抬升到 5")
+	close(release)
+	wg.Wait()
+	waitUntil(t, 5*time.Second, func() bool { return conc.InFlight() == 0 },
+		"请求完成后在途计数应归零")
+}
+
+func TestRoundTripperBypassNotCounted(t *testing.T) {
+	conc, err := governor.NewConcurrencySignal(governor.WithConcurrencyTarget(10))
+	if err != nil {
+		t.Fatalf("NewConcurrencySignal: %v", err)
+	}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	tr, err := New(nil, WithSignalFactory(func() ([]governor.Signal, error) {
+		return []governor.Signal{conc}, nil
+	}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client := &http.Client{Transport: tr}
+
+	for i := 0; i < 3; i++ {
+		req, err := http.NewRequestWithContext(
+			WithoutSuppression(context.Background()), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		go func() {
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond) // 等旁路请求到达阻塞点
+	if got := conc.InFlight(); got != 0 {
+		t.Fatalf("旁路请求不应入在途计数，got %d", got)
+	}
+	close(release)
+}

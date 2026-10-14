@@ -3,7 +3,8 @@
 // 三层结构（理论设计见 docs/desc.md）：
 //
 //   - 感知层（Signal）：把异构反馈归一化为压力指数 S >= 0。
-//     内置 RejectionSignal（成败计数滑窗）与 LatencySignal（延迟 EWMA），
+//     内置 RejectionSignal（成败计数滑窗）、LatencySignal（延迟 EWMA）、
+//     ConcurrencySignal（在途 / 队列深度计数）与 DirectiveSignal（服务端指令），
 //     均可脱离 Governor 单独复用，也可实现 Signal 接入自定义信号。
 //   - 决策层（纯函数）：SuppressionFactor 把 S 映射为抑制因子
 //     alpha = clamp(S/(S+C), 0, 1)；多信号取最差值合成（MaxPressure）。

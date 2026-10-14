@@ -675,3 +675,83 @@ func TestOnTransitionNilRejected(t *testing.T) {
 		t.Fatalf("nil 回调应报错")
 	}
 }
+
+// ---- DirectiveSignal 自动接线（Retry-After 解析） ----
+
+func TestRoundTripperFeedsRetryAfter(t *testing.T) {
+	var header atomic.Value // string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if v, _ := header.Load().(string); v != "" {
+			w.Header().Set("Retry-After", v)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	newClient := func(t *testing.T) (*governor.DirectiveSignal, *http.Client) {
+		t.Helper()
+		dir, err := governor.NewDirectiveSignal(governor.WithDirectiveScale(time.Second))
+		if err != nil {
+			t.Fatalf("NewDirectiveSignal: %v", err)
+		}
+		tr, err := New(nil, WithSignalFactory(func() ([]governor.Signal, error) {
+			return []governor.Signal{dir}, nil
+		}))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return dir, &http.Client{Transport: tr}
+	}
+
+	t.Run("延迟秒数", func(t *testing.T) {
+		dir, client := newClient(t)
+		header.Store("5")
+		resp, err := client.Get(srv.URL)
+		if err != nil || resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("请求应正常返回 429: %v", err)
+		}
+		resp.Body.Close()
+		if p := dir.Pressure(time.Now()); p <= 4 || p > 5 {
+			t.Fatalf("Retry-After: 5 应喂入压力 (4,5]，got %v", p)
+		}
+	})
+
+	t.Run("HTTP日期", func(t *testing.T) {
+		dir, client := newClient(t)
+		header.Store(time.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat))
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		resp.Body.Close()
+		if p := dir.Pressure(time.Now()); p <= 0 || p > 3 {
+			t.Fatalf("HTTP 日期应换算为剩余时长 (0,3]，got %v", p)
+		}
+	})
+
+	t.Run("无头不喂", func(t *testing.T) {
+		dir, client := newClient(t)
+		header.Store("")
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		resp.Body.Close()
+		if p := dir.Pressure(time.Now()); p != 0 {
+			t.Fatalf("无 Retry-After 不应喂入，got %v", p)
+		}
+	})
+
+	t.Run("不可解析不喂", func(t *testing.T) {
+		dir, client := newClient(t)
+		header.Store("soon-ish")
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		resp.Body.Close()
+		if p := dir.Pressure(time.Now()); p != 0 {
+			t.Fatalf("不可解析的 Retry-After 不应喂入，got %v", p)
+		}
+	})
+}

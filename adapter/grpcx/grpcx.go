@@ -15,7 +15,10 @@
 //   - 信号集合中的 governor.ConcurrencySignal 由拦截器自动配对计数：
 //     放行后 Enter、调用返回 / 流结束后 Leave，本地丢弃不计入（同 desc.md §3.1），
 //     旁路调用不参与；stream 以流结束为离开点，未读完即弃用的流不会离开，
-//     计数持续抬升——须保证流被读完或以错误终结。
+//     计数持续抬升——须保证流被读完或以错误终结；
+//   - 信号集合中的 governor.DirectiveSignal 由拦截器自动喂入：状态错误携带
+//     RetryInfo detail（google.golang.org/genproto/.../errdetails）时解析出
+//     等待指令并 Feed，无 detail 时不喂。
 //
 // 默认结局分类：ResourceExhausted / Unavailable（429/503 的等价码）与
 // DeadlineExceeded（超时 ≈ 下游变慢）记为失败；Canceled（调用方取消）不计入；
@@ -49,16 +52,17 @@ import (
 
 	"github.com/jninng/governor"
 	"github.com/jninng/observ"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// targetEntry 是单个 target 的实例与其在途计数信号（ConcurrencySignal 自动接线的
-// 对象）。
+// targetEntry 是单个 target 的实例及其自动接线信号（在途计数 / 服务端指令）。
 type targetEntry struct {
-	gov  *governor.Governor
-	conc []*governor.ConcurrencySignal
+	gov       *governor.Governor
+	conc      []*governor.ConcurrencySignal
+	directive []*governor.DirectiveSignal
 }
 
 // Interceptor 持有按 target 惰性创建的 Governor 注册表：Unary 与 Stream 共用。
@@ -122,6 +126,7 @@ func (ix *Interceptor) Unary() grpc.UnaryClientInterceptor {
 		}
 		invokeErr := invoker(ctx, method, req, reply, cc, opts...)
 		dec.Record(ix.recordInput(invokeErr))
+		feedRetryInfo(h.directive, invokeErr)
 		return invokeErr
 	}
 }
@@ -146,6 +151,7 @@ func (ix *Interceptor) Stream() grpc.StreamClientInterceptor {
 		cs, err := streamer(ctx, desc, cc, method, opts...)
 		if err != nil {
 			dec.Record(ix.recordInput(err))
+			feedRetryInfo(h.directive, err)
 			return nil, err
 		}
 		for _, cs2 := range h.conc {
@@ -162,6 +168,7 @@ func (ix *Interceptor) Stream() grpc.StreamClientInterceptor {
 					dec.Record(nil) // RecvMsg 的 io.EOF：流正常读完，记成功
 					return
 				}
+				feedRetryInfo(h.directive, done)
 				dec.Record(ix.recordInput(done))
 			},
 		}, nil
@@ -399,11 +406,16 @@ func (ix *Interceptor) build(target, prefix string) (*targetEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("governor/grpcx: build signals for target %q: %w", target, err)
 	}
-	// 在途计数信号由拦截器自动接线：放行后 Enter、调用返回 / 流结束后 Leave。
+	// 自动接线信号：在途计数（放行后 Enter、调用返回 / 流结束后 Leave）与
+	// 服务端指令（RetryInfo detail 自动喂入）。
 	var conc []*governor.ConcurrencySignal
+	var directive []*governor.DirectiveSignal
 	for _, sig := range sigs {
-		if cs, ok := sig.(*governor.ConcurrencySignal); ok {
+		switch cs := sig.(type) {
+		case *governor.ConcurrencySignal:
 			conc = append(conc, cs)
+		case *governor.DirectiveSignal:
+			directive = append(directive, cs)
 		}
 	}
 	opts := []governor.Option{
@@ -429,7 +441,31 @@ func (ix *Interceptor) build(target, prefix string) (*targetEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("governor/grpcx: build governor for target %q: %w", target, err)
 	}
-	return &targetEntry{gov: g, conc: conc}, nil
+	return &targetEntry{gov: g, conc: conc, directive: directive}, nil
+}
+
+// feedRetryInfo 从 gRPC 状态错误的 RetryInfo detail（google.golang.org/genproto/
+// .../errdetails）中提取等待指令并喂入；非状态错误、无 detail 或延迟非正时不喂。
+// 多条指令信号全部喂入。
+func feedRetryInfo(signals []*governor.DirectiveSignal, err error) {
+	if len(signals) == 0 || err == nil {
+		return
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return
+	}
+	for _, d := range st.Details() {
+		ri, ok := d.(*errdetails.RetryInfo)
+		if !ok || ri.RetryDelay == nil {
+			continue
+		}
+		if delay := ri.RetryDelay.AsDuration(); delay > 0 {
+			for _, s := range signals {
+				s.Feed(delay)
+			}
+		}
+	}
 }
 
 // recordingStream 包装 ClientStream，把流结束作为一次操作记录（只记首个终态）：

@@ -11,7 +11,10 @@
 //     适用于 health check 等不参与抑制的调用；
 //   - 信号集合中的 governor.ConcurrencySignal 由适配器自动配对计数：
 //     放行后 Enter、Record 后 Leave，本地丢弃不计入（同 desc.md §3.1），
-//     旁路请求不参与。
+//     旁路请求不参与；
+//   - 信号集合中的 governor.DirectiveSignal 由适配器自动喂入：响应携带
+//     Retry-After 头（延迟秒数或 HTTP 日期）时解析为等待时长并 Feed，
+//     头缺失或不可解析时不喂。
 //
 // 口径边界：成败记录止步于 RoundTrip——响应体读取阶段的失败（截断、解码错误）
 // 发生在 Record 之后，不进反馈；需要体级成败口径的业务改用 governor.Do / 两段式。
@@ -37,16 +40,20 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/jninng/governor"
 	"github.com/jninng/observ"
 )
 
-// hostEntry 是单个 host 的实例与其在途计数信号（ConcurrencySignal 自动接线的对象）。
+// hostEntry 是单个 host 的实例及其自动接线信号（在途计数 / 服务端指令）。
 type hostEntry struct {
-	gov  *governor.Governor
-	conc []*governor.ConcurrencySignal
+	gov       *governor.Governor
+	conc      []*governor.ConcurrencySignal
+	directive []*governor.DirectiveSignal
 }
 
 // Transport 是 http.RoundTripper 包装：按 host 惰性创建 Governor（首个请求时构造，
@@ -115,6 +122,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	resp, err := t.base.RoundTrip(req)
 	dec.Record(t.recordInput(resp, err))
+	if len(h.directive) > 0 && err == nil && resp != nil {
+		feedRetryAfter(h.directive, resp.Header.Get("Retry-After"))
+	}
 	return resp, err
 }
 
@@ -353,11 +363,16 @@ func (t *Transport) build(host, prefix string) (*hostEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("governor/httpx: build signals for host %q: %w", host, err)
 	}
-	// 在途计数信号由适配器自动接线：放行后 Enter、Record 后 Leave。
+	// 自动接线信号：在途计数（放行后 Enter、Record 后 Leave）与
+	// 服务端指令（Retry-After 头自动喂入）。
 	var conc []*governor.ConcurrencySignal
+	var directive []*governor.DirectiveSignal
 	for _, sig := range sigs {
-		if cs, ok := sig.(*governor.ConcurrencySignal); ok {
+		switch cs := sig.(type) {
+		case *governor.ConcurrencySignal:
 			conc = append(conc, cs)
+		case *governor.DirectiveSignal:
+			directive = append(directive, cs)
 		}
 	}
 	opts := []governor.Option{
@@ -383,5 +398,35 @@ func (t *Transport) build(host, prefix string) (*hostEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("governor/httpx: build governor for host %q: %w", host, err)
 	}
-	return &hostEntry{gov: g, conc: conc}, nil
+	return &hostEntry{gov: g, conc: conc, directive: directive}, nil
+}
+
+// feedRetryAfter 解析 Retry-After 头并喂入指令信号：先按延迟秒数（整数）解析，
+// 再按 HTTP 日期解析（取距现在的时长，已过期的日期不喂）。头缺失或不可解析时
+// 不喂。多条指令信号全部喂入。
+func feedRetryAfter(signals []*governor.DirectiveSignal, raw string) {
+	if len(signals) == 0 {
+		return
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(raw); err == nil {
+		if secs < 0 {
+			return
+		}
+		d = time.Duration(secs) * time.Second
+	} else if date, err := http.ParseTime(raw); err == nil {
+		d = time.Until(date)
+		if d <= 0 {
+			return // 日期已过：指令失效
+		}
+	} else {
+		return
+	}
+	for _, s := range signals {
+		s.Feed(d)
+	}
 }

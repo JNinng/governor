@@ -12,10 +12,12 @@ import (
 
 	"github.com/jninng/governor"
 	"github.com/jninng/observ"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // countingSignal 记录 Observe 喂入的结局分布，Pressure 恒 0（只测分类，不触发抑制）。
@@ -674,5 +676,80 @@ func TestUnaryOnTransition(t *testing.T) {
 	}
 	if _, err := New(WithOnTransition(nil)); err == nil {
 		t.Fatalf("nil 回调应报错")
+	}
+}
+
+// ---- DirectiveSignal 自动接线（RetryInfo 解析） ----
+
+func TestUnaryFeedsRetryInfo(t *testing.T) {
+	dir, err := governor.NewDirectiveSignal()
+	if err != nil {
+		t.Fatalf("NewDirectiveSignal: %v", err)
+	}
+	ix, err := New(WithSignalFactory(fixedSignals(dir)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cc := newConn(t, "a.example:1")
+
+	// 携带 RetryInfo detail 的 ResourceExhausted：解析出 30s 指令。
+	st, err := status.New(codes.ResourceExhausted, "rate limited").WithDetails(
+		&errdetails.RetryInfo{RetryDelay: durationpb.New(30 * time.Second)})
+	if err != nil {
+		t.Fatalf("WithDetails: %v", err)
+	}
+	inv := &countingInvoker{err: st.Err()}
+	got := ix.Unary()(context.Background(), "/pkg.Svc/Method", struct{}{}, struct{}{},
+		cc, inv.invoke)
+	if status.Code(got) != codes.ResourceExhausted {
+		t.Fatalf("错误应原样透出，got %v", got)
+	}
+	if p := dir.Pressure(time.Now()); p <= 29 || p > 30 {
+		t.Fatalf("RetryInfo 30s 应喂入压力 (29,30]，got %v", p)
+	}
+
+	// 无 detail 的错误：不喂（全新信号保持 0）。
+	dir2, err := governor.NewDirectiveSignal()
+	if err != nil {
+		t.Fatalf("NewDirectiveSignal: %v", err)
+	}
+	ix2, err := New(WithSignalFactory(fixedSignals(dir2)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cc2 := newConn(t, "b.example:1")
+	plain := &countingInvoker{err: status.Error(codes.ResourceExhausted, "no details")}
+	if err := ix2.Unary()(context.Background(), "/pkg.Svc/Method", struct{}{}, struct{}{},
+		cc2, plain.invoke); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("错误应原样透出，got %v", err)
+	}
+	if p := dir2.Pressure(time.Now()); p != 0 {
+		t.Fatalf("无 RetryInfo 不应喂入，got %v", p)
+	}
+}
+
+func TestStreamFeedsRetryInfo(t *testing.T) {
+	dir, err := governor.NewDirectiveSignal()
+	if err != nil {
+		t.Fatalf("NewDirectiveSignal: %v", err)
+	}
+	ix, err := New(WithSignalFactory(fixedSignals(dir)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cc := newConn(t, "a.example:1")
+
+	st, err := status.New(codes.Unavailable, "overloaded").WithDetails(
+		&errdetails.RetryInfo{RetryDelay: durationpb.New(2 * time.Second)})
+	if err != nil {
+		t.Fatalf("WithDetails: %v", err)
+	}
+	_, got := ix.Stream()(context.Background(), &grpc.StreamDesc{ServerStreams: true},
+		cc, "/pkg.Svc/Method", (&countingStreamer{err: st.Err()}).stream)
+	if status.Code(got) != codes.Unavailable {
+		t.Fatalf("建流错误应原样透出，got %v", got)
+	}
+	if p := dir.Pressure(time.Now()); p <= 1 || p > 2 {
+		t.Fatalf("建流失败的 RetryInfo 2s 应喂入压力 (1,2]，got %v", p)
 	}
 }

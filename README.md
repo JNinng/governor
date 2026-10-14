@@ -240,8 +240,9 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 | `RejectionSignal`（场景 A） | 滑窗失败率超 1/K | 下游**显式拒绝**：HTTP 429/503、RPC 错误 | `WithRejectionK` 2.0（容忍 50% 失败）、`WithRejectionWindow` 90s |
 | `LatencySignal`（场景 B） | EWMA 耗时超目标值 | 下游**变慢但不报错**：P99 劣化、写入堆积 | `WithLatencyTarget` 200ms、`WithLatencyBeta` 0.4、`WithLatencyWindow` 90s |
 | `ConcurrencySignal`（内置） | 在途 / 队列深度超 N_target | **本地过载**：在途打满、队列堆积 | `WithConcurrencyTarget` 100 |
+| `DirectiveSignal`（内置） | 下游下发等待指令 | **显式指令**：429 + `Retry-After`、gRPC `RetryInfo` | `WithDirectiveScale` 1s |
 | 两者组合 | 取最差值，任一维度过载即抑制 | 错误与变慢互为前兆（推荐默认） | — |
-| 自定义 `Signal` | 任意口径 | 内置三类的口径都不合适 | 实现 `Name/Observe/Pressure` 三方法 |
+| 自定义 `Signal` | 任意口径 | 内置四类的口径都不合适 | 实现 `Name/Observe/Pressure` 三方法 |
 
 ### 参数往哪调
 
@@ -276,6 +277,7 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 拒绝信号  S_rej = max(0, (N_total − K·N_success) / (N_total + 1))   成功率高于 1/K 时恒 0
 延迟信号  S_lat = max(0, (L_ewma − L_target) / L_target)            延迟低于目标时恒 0
 并发信号  S_con = max(0, (n − N_target) / N_target)                 n ≤ N_target 时恒 0
+指令信号  S_dir = 剩余等待时长 / 换算基准                            随指令到期线性归零
 多信号    S     = max(S_1, …, S_n)                                 最差信号优先
 抑制因子  α     = clamp(S / (S + C), 0, 1)                          S=C 时 α=0.5，渐近 1 不达 1
 ```
@@ -325,6 +327,28 @@ defer conc.Leave()
 `ConcurrencySignal` 无需业务干预；流式 RPC 以流结束为离开点，未读完即弃用的流
 不会离开（计数持续抬升），须保证流被读完或以错误终结。计数不随时间衰减，
 未配对的 `Enter` 会永久抬高压力，务必配对。
+
+### 服务端指令信号（DirectiveSignal）
+
+下游显式下发的等待指令（429 + `Retry-After`、gRPC `RetryInfo`）是最权威的压力
+来源——无需等滑窗 / EWMA 慢慢收敛。喂入时 S = 指令时长 / 换算基准（默认 1s，
+`WithDirectiveScale` 可调，即"服务端要求等 1s 时 S=1"），随后随指令自身时长
+**线性衰减至 0**：到期自行解除，不产生陈旧压力钉住 α。与其他信号经 `max`
+合成，无特殊通道；`Observe` 为空实现，`Record` 反馈不改变它。
+
+喂入两条路，调同一方法（`Feed` / `FeedAt`，后者供时钟注入的测试）：
+
+```go
+dir, _ := governor.NewDirectiveSignal()
+g, _ := governor.New(governor.WithSignals(rej, dir))
+
+dir.Feed(30 * time.Second) // 业务手动喂：X-RateLimit 等无统一格式的头自行换算
+```
+
+经[传输层适配器](#传输层适配器)使用时**自动解析**：httpx 解析 `Retry-After` 头
+（延迟秒数与 HTTP 日期两种形式，缺失或不可解析不喂）；grpcx 解析状态错误的
+`RetryInfo` detail。`Record` 的失败分类与指令喂入并存——失败率给大势，
+指令给即时且精确的收敛速度。
 
 ## 业务自定义决策（只读暴露）
 
@@ -514,6 +538,8 @@ req = req.WithContext(governorhttp.WithoutSuppression(ctx))
 网络错误与 429/5xx 记失败、调用方取消不计入、其余成功；指标前缀 `governor_<host>`
 （host 中的 `.`、`:` 等字符替换为 `_`）。信号工厂、分类器、C、探测比例、前缀与
 Meter 均可经 option 调整；`Governor(host)` 可取实例查询只读状态。
+信号集合中的 `ConcurrencySignal` / `DirectiveSignal` 自动接线：前者放行后 `Enter`、
+`Record` 后 `Leave`，后者遇 `Retry-After` 头自动喂入（延迟秒数与 HTTP 日期两种形式）。
 
 两点口径说明：成败记录止步于 RoundTrip，响应体读取阶段的失败（截断、解码错误）
 不进反馈，需要体级成败口径的业务改用 `governor.Do`/两段式；http.Client 的重定向
@@ -550,6 +576,8 @@ unary 以一次调用为一操作；stream 以流结束为一操作——`RecvMs
 （429/503 与超时的等价码），`Canceled` 及其余错误码不计入（多与业务语义相关而非
 过载），可经 `WithClassifier` 整体替换。option 与 HTTP 适配器一致；不同 target
 规整后前缀碰撞同样会在创建时报错。
+信号集合中的 `ConcurrencySignal` / `DirectiveSignal` 自动接线：前者放行后 `Enter`、
+调用返回 / 流结束后 `Leave`，后者遇状态错误的 `RetryInfo` detail 自动喂入。
 
 ## 埋点（observ）
 

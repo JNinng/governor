@@ -195,10 +195,17 @@ for {
 | `LatencySignal` | `WithLatencyBeta`（β） | 0.4 | (0, 1)，建议 0.3~0.5 | EWMA 平滑系数；调大更平滑，调小跟手但易抖动 |
 | `LatencySignal` | `WithLatencyWindow` | 90s | > 0 | 采样饥饿阈值；窗口内无新采样时沿用上一次计算出的压力 |
 | `ConcurrencySignal` | `WithConcurrencyTarget`（N_target） | 100 | > 0 | 压力=0的分界线：n ≤ N_target 恒不抑制，超出线性升压（n = 2×N_target 时 S=1）；按下游并发容量设定 |
+| `DirectiveSignal` | `WithDirectiveScale` | 1s | > 0 | 换算基准：服务端要求等待该时长时 S=1（5s 指令 → S=5）；指令压力随自身时长线性衰减，到期自行解除 |
 
 `ConcurrencySignal` 以 `Enter`/`Leave` 显式配对计数（在途 / 队列深度），不参与
 上述窗口与饥饿语义：计数恒反映当前状态，不随时间衰减；经传输层适配器使用时
 由适配器自动配对（放行后起算，本地丢弃不计入）。
+
+`DirectiveSignal` 以 `Feed`/`FeedAt` 喂入服务端等待指令（HTTP `Retry-After`、
+gRPC `RetryInfo`），同样不参与窗口与饥饿语义：喂入时 S = 指令时长 / 换算基准，
+随指令自身时长线性衰减至 0——到期自行解除，不产生陈旧压力；喂入 0 等于清除。
+经传输层适配器使用时由适配器自动解析；`X-RateLimit` 等无统一格式的头由业务
+自行换算后调用同一方法。
 
 ## 参数总表
 
@@ -214,3 +221,4 @@ for {
 | `WithLatencyBeta` | LatencySignal | 0.4 | (0, 1) | ❌（构造期） |
 | `WithLatencyWindow` | LatencySignal | 90s | > 0 | ❌（构造期） |
 | `WithConcurrencyTarget` | ConcurrencySignal | 100 | > 0 | ❌（构造期） |
+| `WithDirectiveScale` | DirectiveSignal | 1s | > 0 | ❌（构造期） |

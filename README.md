@@ -241,7 +241,7 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 | `LatencySignal`（场景 B） | EWMA 耗时超目标值 | 下游**变慢但不报错**：P99 劣化、写入堆积 | `WithLatencyTarget` 200ms、`WithLatencyBeta` 0.4、`WithLatencyWindow` 90s |
 | `ConcurrencySignal`（内置） | 在途 / 队列深度超 N_target | **本地过载**：在途打满、队列堆积 | `WithConcurrencyTarget` 100 |
 | `DirectiveSignal`（内置） | 下游下发等待指令 | **显式指令**：429 + `Retry-After`、gRPC `RetryInfo` | `WithDirectiveScale` 1s |
-| 两者组合 | 取最差值，任一维度过载即抑制 | 错误与变慢互为前兆（推荐默认） | — |
+| 多信号组合 | 取最差值，任一维度过载即抑制 | 错误与变慢互为前兆（推荐默认） | — |
 | 自定义 `Signal` | 任意口径 | 内置四类的口径都不合适 | 实现 `Name/Observe/Pressure` 三方法 |
 
 ### 参数往哪调
@@ -283,6 +283,7 @@ time=...level=INFO  msg="governor: suppression stopped (alpha reached 0)" pressu
 ```
 
 ```go
+lat, _ := governor.NewLatencySignal() // 场景 B：EWMA 耗时超目标值产生压力
 rej, _ := governor.NewRejectionSignal() // 场景 A：失败率超 1/K（默认容忍 50%）产生压力
 g, _ := governor.New(governor.WithSignals(lat, rej)) // 多信号取最差值（最差信号优先）
 ```
@@ -460,9 +461,10 @@ if err := g.Update(
 
 - **原子生效**：全部 option 应用并校验通过后才整体切换；失败时旧配置仍在用。
 - **结构性字段不可变更**：信号集合、分类器、时钟、Meter、Logger、指标前缀、
-  随机源传入 `Update` 会被拒绝（信号类型与口径保持稳定，统计连续可比）。
+  跃迁回调、随机源传入 `Update` 会被拒绝（信号类型与口径保持稳定，统计连续可比）。
   信号自身参数（`WithRejectionK` / `WithRejectionWindow` / `WithLatencyTarget` /
-  `WithLatencyBeta` / `WithLatencyWindow`）同为构造期固定，运行时不可调整；
+  `WithLatencyBeta` / `WithLatencyWindow` / `WithConcurrencyTarget` /
+  `WithDirectiveScale`）同为构造期固定，运行时不可调整；
   口径级变更（换 K / target / 窗口 / β）须按新口径重建信号与 Governor（统计清零）。
 - 更新成功记一条 INFO 日志（含各参数 from→to），便于审计谁在何时调了什么。
 

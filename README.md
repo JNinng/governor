@@ -361,6 +361,15 @@ for _, snap := range g.Signals() {
 if s > 2 { /* 业务侧切只读模式等，观测不是控制 */ }
 ```
 
+挂调试端点用 `Snapshot`：单次加锁采集三个只读出口，反馈路径驱动的状态严格一致
+（`Feed`/`Enter` 外部喂入的信号各自为原子读），带 JSON 友好标签可直接序列化：
+
+```go
+snap := g.Snapshot()
+// {"pressure":2,"suppression":0.667,"signals":[{"name":"latency","pressure":2}]}
+json.NewEncoder(w).Encode(snap)
+```
+
 ## 状态跃迁回调（OnTransition）
 
 跃迁目前只走日志；接告警 / webhook 用 `WithOnTransition` 类型化回调
@@ -618,7 +627,7 @@ Prometheus / OTel 等适配器以 [observ](https://github.com/jninng/observ)
 ## 能力边界（ADR-0002）
 
 控制动作仅丢弃、缩批、延迟三种；另有只读输出（`Pressure` / `Suppression` /
-`Signals`），供观测，不参与控制。它不是熔断器（无状态机）、不内置降级
+`Signals` / `Snapshot`），供观测，不参与控制。它不是熔断器（无状态机）、不内置降级
 （被抑制时以 `ErrSuppressed` 快速失败，降级响应由业务构造）、不是并发信号量
 （不限 in-flight）、不是重试引擎（`Wait` 只延后请求、不丢弃，不是失败后的退避）。
 完整否定清单见 [ADR-0002](docs/adr/0002-flow-control-only-no-breaker.md)。

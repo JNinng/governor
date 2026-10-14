@@ -44,8 +44,8 @@ func (systemClock) Sleep(ctx context.Context, d time.Duration) {
 
 // SignalSnapshot 是信号的只读观测值（暴露面，非控制动作）。
 type SignalSnapshot struct {
-	Name     string
-	Pressure float64
+	Name     string  `json:"name"`
+	Pressure float64 `json:"pressure"`
 }
 
 // Governor 是绑定单一远端目标的流控器：聚合压力信号，输出抑制决策。

@@ -24,7 +24,7 @@
 // # 能力边界（ADR-0002）
 //
 // 本库的全部控制输出即上述三种动作，另有只读观测输出
-// （Pressure/Suppression/Signals、状态跃迁回调 OnTransition，观测不是控制）。
+// （Pressure/Suppression/Signals/Snapshot、状态跃迁回调 OnTransition，观测不是控制）。
 // 它是连续、概率式的
 // 流量调节器：alpha 严格小于 1；探测开启时（默认 2%，可用
 // WithProbeRatio(0) 关闭，关闭后深度抑制可逼近全丢）反馈路径永不归零。

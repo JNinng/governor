@@ -376,8 +376,8 @@ json.NewEncoder(w).Encode(snap)
 
 ## 状态跃迁回调（OnTransition）
 
-跃迁目前只走日志；接告警 / webhook 用 `WithOnTransition` 类型化回调
-（构造期固定，`Update` 拒绝更换），不再解析日志文本。跃迁在锁内判定、**锁外同步
+跃迁默认以日志输出（低频 INFO/WARN）；接告警 / webhook 用 `WithOnTransition` 类型化回调
+（构造期固定，`Update` 拒绝更换），无需解析日志文本。跃迁在锁内判定、**锁外同步
 派发**——回调慢只拖慢触发它的那次调用，不阻塞其他请求，但仍须快速返回；
 panic 一律 recover。只推跃迁（低频），DEBUG 级 wait/batch 逐次变化不进回调；
 并发触发时回调间不保证全局到达顺序（锁内日志有序），顺序以事件的 From/To 为准。
@@ -530,7 +530,7 @@ for key, snaps := range grp.Signals() { // 聚合信号快照：map[key][]Signal
 
 ### HTTP（RoundTripper）
 
-`adapter/httpx`（`governorhttp`），纯标准库，随核心模块分发：
+`adapter/httpx`（`governorhttp`），仅依赖标准库与核心包，随核心模块分发：
 
 ```go
 import governorhttp "github.com/jninng/governor/adapter/httpx"
@@ -562,8 +562,8 @@ Meter 均可经 option 调整；`Governor(host)` 可取实例查询只读状态�
 
 ### gRPC（client interceptor）
 
-`adapter/grpcx`（`governorgrpc`），独立 module：核心库不引入 grpc-go 依赖
-（ADR-0001 同款考量），用到的项目单独引入：
+`adapter/grpcx`（`governorgrpc`），独立 module：核心库不引入 grpc-go 依赖，
+用到的项目单独引入：
 
 ```go
 import governorgrpc "github.com/jninng/governor/adapter/grpcx"
@@ -602,7 +602,7 @@ import "log/slog"
 
 g, _ := governor.New(
 	governor.WithSignals(lat),
-	governor.WithLogger(slog.Default()), // *slog.Logger；缺省为 discard，默认静默
+	governor.WithLogger(slog.Default()), // 缺省 discard（默认静默）
 	governor.WithMetricPrefix("redis"),  // 多实例区分（指标无属性 label）；默认 "governor"
 )
 ```
@@ -611,7 +611,7 @@ g, _ := governor.New(
 
 ```go
 // 显式注入：用你的 provider 造一个 Meter 传入
-meter := provider.Meter("myapp") // provider 为 sdkmetric.MeterProvider 等
+meter := provider.Meter("myapp") // provider 如 go.opentelemetry.io/otel/sdk/metric 的 *MeterProvider
 governor.New(governor.WithSignals(lat), governor.WithMeter(meter))
 
 // 全局联动：不传 WithMeter 时缺省取全局 MeterProvider——
@@ -620,8 +620,8 @@ otel.SetMeterProvider(provider)
 governor.New(governor.WithSignals(lat))
 ```
 
-全局 provider 仅首次 `SetMeterProvider` 生效：此前创建的实例（含 `Group.Get` /
-适配器惰性创建的）随之自动接入，之后再 Set 不追溯。运行时依赖限于
+全局 provider 只有首次 `SetMeterProvider` 生效：此前创建的实例（含 `Group.Get` /
+适配器惰性创建的）随之自动接入，之后再次 Set 被忽略。运行时依赖限于
 `go.opentelemetry.io/otel`（缺省联动用）与 `go.opentelemetry.io/otel/metric`
 （sdk 仅测试断言时需要）。
 

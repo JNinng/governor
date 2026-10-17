@@ -14,7 +14,8 @@ import (
 	"time"
 
 	"github.com/jninng/governor"
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 // countingSignal 记录 Observe 喂入的结局分布，Pressure 恒 0（只测分类，不触发抑制）。
@@ -422,9 +423,20 @@ func TestConcurrentRequests(t *testing.T) {
 
 // ---- 指标前缀与碰撞检测 ----
 
+// recordingMeter 包装真实 Meter 并记录创建的仪表名，验证前缀生成
+// （otel 同步仪表接口密封，无法自造假仪表，故委托真实 provider）。
 type recordingMeter struct {
+	metric.Meter
 	mu    sync.Mutex
 	names []string
+}
+
+func newRecordingMeter(t *testing.T) *recordingMeter {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	return &recordingMeter{Meter: provider.Meter("httpx_test")}
 }
 
 func (m *recordingMeter) record(name string) {
@@ -439,34 +451,30 @@ func (m *recordingMeter) created() []string {
 	return append([]string(nil), m.names...)
 }
 
-func (m *recordingMeter) NewCounter(name, _ string) observ.Counter {
+func (m *recordingMeter) Int64Counter(name string, opts ...metric.Int64CounterOption) (metric.Int64Counter, error) {
 	m.record(name)
-	return nopCounter{}
-}
-func (m *recordingMeter) NewGauge(name, _ string) observ.Gauge { m.record(name); return nopGauge{} }
-func (m *recordingMeter) NewHistogram(name, _ string, _ []float64) observ.Histogram {
-	m.record(name)
-	return nopHistogram{}
+	return m.Meter.Int64Counter(name, opts...)
 }
 
-type nopCounter struct{}
+func (m *recordingMeter) Int64Gauge(name string, opts ...metric.Int64GaugeOption) (metric.Int64Gauge, error) {
+	m.record(name)
+	return m.Meter.Int64Gauge(name, opts...)
+}
 
-func (nopCounter) Inc()        {}
-func (nopCounter) Add(float64) {}
+func (m *recordingMeter) Float64Gauge(name string, opts ...metric.Float64GaugeOption) (metric.Float64Gauge, error) {
+	m.record(name)
+	return m.Meter.Float64Gauge(name, opts...)
+}
 
-type nopGauge struct{}
-
-func (nopGauge) Set(float64) {}
-func (nopGauge) Add(float64) {}
-
-type nopHistogram struct{}
-
-func (nopHistogram) Observe(float64) {}
+func (m *recordingMeter) Float64Histogram(name string, opts ...metric.Float64HistogramOption) (metric.Float64Histogram, error) {
+	m.record(name)
+	return m.Meter.Float64Histogram(name, opts...)
+}
 
 func TestMetricPrefixPerHost(t *testing.T) {
 	srv := statusServer(http.StatusOK, nil)
 	defer srv.Close()
-	m := &recordingMeter{}
+	m := newRecordingMeter(t)
 	tr, err := New(nil, WithMeter(m))
 	if err != nil {
 		t.Fatalf("New: %v", err)

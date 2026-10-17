@@ -46,7 +46,7 @@ import (
 	"time"
 
 	"github.com/jninng/governor"
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // hostEntry 是单个 host 的实例及其自动接线信号（在途计数 / 服务端指令）。
@@ -68,7 +68,7 @@ type Transport struct {
 	newSignals   func() ([]governor.Signal, error)
 	classify     func(resp *http.Response, err error) governor.Outcome
 	prefix       func(host string) string
-	meter        observ.Meter
+	meter        metric.Meter
 	sensitiv     *float64
 	probeRatio   *float64
 	onTransition func(host string, tr governor.Transition)
@@ -208,8 +208,8 @@ func WithProbeRatio(r float64) Option {
 	}
 }
 
-// WithMetricPrefix 注入指标前缀函数。observ 无 label，前缀是唯一合规的实例级隔离
-// 手段（ADR-0001）；nil 报错；不传时默认 "governor_<host>"（host 中除 [a-z0-9_]
+// WithMetricPrefix 注入指标前缀函数。指标无属性 label，前缀是唯一合规的实例级
+// 隔离手段（ADR-0001）；nil 报错；不传时默认 "governor_<host>"（host 中除 [a-z0-9_]
 // 外的字符替换为下划线）。不同 host 规整后产生相同前缀时，后创建的 host 报错，
 // 自定义前缀函数的输出同样参与检测。
 func WithMetricPrefix(prefix func(host string) string) Option {
@@ -222,8 +222,9 @@ func WithMetricPrefix(prefix func(host string) string) Option {
 	}
 }
 
-// WithMeter 注入指标 Meter（不传为 observ.NoopMeter），不得为 nil。
-func WithMeter(m observ.Meter) Option {
+// WithMeter 注入指标 Meter（不传跟随 governor 缺省：取全局 MeterProvider，
+// 未配置即 noop 静默），不得为 nil。
+func WithMeter(m metric.Meter) Option {
 	return func(t *Transport) error {
 		if m == nil {
 			return fmt.Errorf("governor/httpx: meter must not be nil")

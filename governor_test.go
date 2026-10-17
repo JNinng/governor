@@ -3,6 +3,7 @@ package governor
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"sync"
 	"testing"
@@ -370,8 +371,8 @@ func TestConcurrentMixedPaths(t *testing.T) {
 		WithClock(clk),
 		WithBatch(100, 1),
 		WithBaseWait(10*time.Millisecond),
-		WithMeter(newFakeMeter()),
-		WithLogger(&fakeLogger{}),
+		WithMeter(newRecordingMeter(t)),
+		WithLogger(slog.New(&recordHandler{})),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -409,8 +410,8 @@ func TestConcurrentMixedPaths(t *testing.T) {
 func TestUpdateAppliesTuningParams(t *testing.T) {
 	clk := newFakeClock()
 	sig, _ := NewLatencySignal(WithLatencyTarget(100*time.Millisecond), WithLatencyBeta(0.5))
-	lg := &fakeLogger{}
-	g, _ := New(WithSignals(sig), WithClock(clk), WithLogger(lg), WithBatch(100, 1))
+	lh := &recordHandler{}
+	g, _ := New(WithSignals(sig), WithClock(clk), WithLogger(slog.New(lh)), WithBatch(100, 1))
 
 	// 制造压力：S=0.5
 	dec := g.Begin()
@@ -446,7 +447,7 @@ func TestUpdateAppliesTuningParams(t *testing.T) {
 	}
 	// 更新成功应记一条 info 日志
 	found := false
-	for _, e := range lg.snapshot() {
+	for _, e := range lh.snapshot() {
 		if e.msg == "governor: config updated" {
 			found = true
 		}
@@ -491,8 +492,8 @@ func TestUpdateRejectsStructuralOptions(t *testing.T) {
 		WithSignals(other),
 		WithClassifier(func(error) Outcome { return OutcomeSuccess }),
 		WithClock(newFakeClock()),
-		WithMeter(newFakeMeter()),
-		WithLogger(&fakeLogger{}),
+		WithMeter(newRecordingMeter(t)),
+		WithLogger(slog.New(&recordHandler{})),
 		WithMetricPrefix("other"),
 		withRandSource(float64s(0.5)),
 	}
@@ -518,8 +519,8 @@ func TestUpdateConcurrentWithHotPaths(t *testing.T) {
 		WithClock(clk),
 		WithBatch(100, 1),
 		WithBaseWait(time.Millisecond),
-		WithMeter(newFakeMeter()),
-		WithLogger(&fakeLogger{}),
+		WithMeter(newRecordingMeter(t)),
+		WithLogger(slog.New(&recordHandler{})),
 	)
 
 	var wg sync.WaitGroup

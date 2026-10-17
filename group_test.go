@@ -6,51 +6,7 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/jninng/observ"
 )
-
-// recordingMeter 记录创建的指标名，验证按 key 生成的前缀。
-type recordingMeter struct {
-	mu    sync.Mutex
-	names []string
-}
-
-func (m *recordingMeter) record(name string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.names = append(m.names, name)
-}
-
-func (m *recordingMeter) created() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]string(nil), m.names...)
-}
-
-func (m *recordingMeter) NewCounter(name, _ string) observ.Counter {
-	m.record(name)
-	return nopCounter{}
-}
-func (m *recordingMeter) NewGauge(name, _ string) observ.Gauge { m.record(name); return nopGauge{} }
-func (m *recordingMeter) NewHistogram(name, _ string, _ []float64) observ.Histogram {
-	m.record(name)
-	return nopHistogram{}
-}
-
-type nopCounter struct{}
-
-func (nopCounter) Inc()        {}
-func (nopCounter) Add(float64) {}
-
-type nopGauge struct{}
-
-func (nopGauge) Set(float64) {}
-func (nopGauge) Add(float64) {}
-
-type nopHistogram struct{}
-
-func (nopHistogram) Observe(float64) {}
 
 // ---- 惰性创建与复用 ----
 
@@ -159,7 +115,7 @@ func TestGroupSignalsAggregate(t *testing.T) {
 // ---- 指标前缀按 key 生成 ----
 
 func TestGroupMetricPrefixPerKey(t *testing.T) {
-	m := &recordingMeter{}
+	m := newRecordingMeter(t)
 	grp, err := NewGroup(WithGovernorOptions(WithMeter(m)))
 	if err != nil {
 		t.Fatalf("NewGroup: %v", err)
@@ -183,7 +139,7 @@ func TestGroupMetricPrefixPerKey(t *testing.T) {
 	}
 
 	// 自定义前缀函数：输出原样使用。
-	custom := &recordingMeter{}
+	custom := newRecordingMeter(t)
 	grp2, err := NewGroup(
 		WithKeyPrefix(func(key string) string { return "svc_" + key }),
 		WithGovernorOptions(WithMeter(custom)),

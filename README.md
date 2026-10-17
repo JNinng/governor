@@ -15,6 +15,9 @@
 go get github.com/jninng/governor
 ```
 
+要求 Go 1.25+（埋点侧依赖 `log/slog` 与 [OpenTelemetry](https://opentelemetry.io) 指标 API，
+见[埋点](#埋点opentelemetry-指标--slog-日志)）。
+
 ## 快速上手
 
 用法三条：
@@ -38,7 +41,7 @@ governor.Do(ctx, g, op)
 |---|---|---|
 | [minimal](example/minimal/main.go) | 最小闭环：一个延迟信号 + `Do` + 降级分支 | `go run ./example/minimal` |
 | [bff](example/bff/main.go) | 业务场景：晚高峰劣化 → 本地缓存兜底 | `go run ./example/bff` |
-| [http](example/http/main.go) | 真实 `http.Client` 调用 + observ 日志与降级统计 | `go run ./example/http` |
+| [http](example/http/main.go) | 真实 `http.Client` 调用 + slog 日志与降级统计 | `go run ./example/http` |
 | [wait](example/wait/main.go) | 策略三延迟执行：等待随压力阶梯升降，零丢弃 | `go run ./example/wait` |
 
 ### 复制即跑的最小示例
@@ -140,8 +143,8 @@ func main() {
 
 `go run ./example/http`（[example/http/main.go](example/http/main.go)）换用真实
 网络栈：本地起一个响应 250ms 的"过载服务"（目标 100ms），`governor.Do` 包住
-`http.Client` 调用。示例同时演示 observ 的接入方式，slog 以 Info 阈值接入，
-只出状态跃迁日志，结束时汇总放行与降级统计：
+`http.Client` 调用。示例同时演示日志的接入方式（`WithLogger` 注入 `*slog.Logger`，
+以 Info 阈值只出状态跃迁日志），结束时汇总放行与降级统计：
 
 ```bash
 go run ./example/http
@@ -590,29 +593,42 @@ unary 以一次调用为一操作；stream 以流结束为一操作——`RecvMs
 信号集合中的 `ConcurrencySignal` / `DirectiveSignal` 自动接线：前者放行后 `Enter`、
 调用返回 / 流结束后 `Leave`，后者遇状态错误的 `RetryInfo` detail 自动喂入。
 
-## 埋点（observ）
+## 埋点（OpenTelemetry 指标 + slog 日志）
+
+日志注入标准库 `*slog.Logger`，指标注入 OpenTelemetry 的 `metric.Meter`：
 
 ```go
-import (
-	"log/slog"
-
-	"github.com/jninng/observ"
-)
+import "log/slog"
 
 g, _ := governor.New(
 	governor.WithSignals(lat),
-	governor.WithLogger(observ.NewSlogLogger(slog.Default())), // 缺省快照 observ.DefaultLogger()
-	governor.WithMetricPrefix("redis"), // 多实例区分（无 label 约束）；默认 "governor"
+	governor.WithLogger(slog.Default()), // *slog.Logger；缺省为 discard，默认静默
+	governor.WithMetricPrefix("redis"),  // 多实例区分（指标无属性 label）；默认 "governor"
 )
 ```
 
-`WithMeter` 接受任意 `observ.Meter` 实现（默认 `observ.NoopMeter`）；
-Prometheus / OTel 等适配器以 [observ](https://github.com/jninng/observ)
-仓库实际发布的模块为准。
+指标两种接法：
+
+```go
+// 显式注入：用你的 provider 造一个 Meter 传入
+meter := provider.Meter("myapp") // provider 为 sdkmetric.MeterProvider 等
+governor.New(governor.WithSignals(lat), governor.WithMeter(meter))
+
+// 全局联动：不传 WithMeter 时缺省取全局 MeterProvider——
+// 未配置即 noop 静默，首次 otel.SetMeterProvider 后已建 Governor 自动接入
+otel.SetMeterProvider(provider)
+governor.New(governor.WithSignals(lat))
+```
+
+全局 provider 仅首次 `SetMeterProvider` 生效：此前创建的实例（含 `Group.Get` /
+适配器惰性创建的）随之自动接入，之后再 Set 不追溯。运行时依赖限于
+`go.opentelemetry.io/otel`（缺省联动用）与 `go.opentelemetry.io/otel/metric`
+（sdk 仅测试断言时需要）。
 
 指标一览（前缀默认 `governor`）：`_pressure`、`_suppression`、`_batch_size`、
 `_wait_seconds`（gauge），`_decisions_allow_total` / `_decisions_drop_total` /
 `_decisions_probe_total`（counter），`_operations_seconds`（histogram）。
+指标名与耗时单位保持 snake_case 口径（`*_total` / `_seconds`）。
 放行决策只计 allow、探测放行只计 probe（互斥不叠加）；`_operations_seconds`
 只统计实际发往远端的操作耗时，被 `OutcomeIgnore` 分类（如调用方取消）的不计入。
 

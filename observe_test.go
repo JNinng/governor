@@ -7,114 +7,138 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-// ---- 假 Meter / 假 Logger（公共接口 observ.Meter / observ.Logger 上的替身）----
+// ---- 测试替身：真实 provider 上的 Meter（otel 同步仪表接口密封，无法自造假仪表）----
 
-type fakeCounter struct {
-	mu sync.Mutex
-	v  float64
-}
-
-func (c *fakeCounter) Inc() { c.Add(1) }
-func (c *fakeCounter) Add(v float64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.v += v
-}
-func (c *fakeCounter) value() float64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.v
+func newTestMeter(t *testing.T) (metric.Meter, *sdkmetric.ManualReader) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	return provider.Meter("governor_test"), reader
 }
 
-type fakeGauge struct {
-	mu sync.Mutex
-	v  float64
+// recordingMeter 包装真实 Meter 并记录创建的仪表名，验证前缀生成。
+type recordingMeter struct {
+	metric.Meter
+	mu    sync.Mutex
+	names []string
 }
 
-func (g *fakeGauge) Set(v float64) { g.mu.Lock(); defer g.mu.Unlock(); g.v = v }
-func (g *fakeGauge) Add(v float64) { g.mu.Lock(); defer g.mu.Unlock(); g.v += v }
-func (g *fakeGauge) value() float64 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.v
+func newRecordingMeter(t *testing.T) *recordingMeter {
+	t.Helper()
+	m, _ := newTestMeter(t)
+	return &recordingMeter{Meter: m}
 }
 
-type fakeHistogram struct {
-	mu   sync.Mutex
-	vals []float64
+func (m *recordingMeter) record(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.names = append(m.names, name)
 }
 
-func (h *fakeHistogram) Observe(v float64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.vals = append(h.vals, v)
-}
-func (h *fakeHistogram) values() []float64 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]float64, 0, len(h.vals))
-	return append(out, h.vals...)
+func (m *recordingMeter) created() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.names...)
 }
 
-type fakeMeter struct {
-	mu        sync.Mutex
-	counters  map[string]*fakeCounter
-	gauges    map[string]*fakeGauge
-	histogram map[string]*fakeHistogram
+func (m *recordingMeter) Int64Counter(name string, opts ...metric.Int64CounterOption) (metric.Int64Counter, error) {
+	m.record(name)
+	return m.Meter.Int64Counter(name, opts...)
 }
 
-func newFakeMeter() *fakeMeter {
-	return &fakeMeter{
-		counters:  map[string]*fakeCounter{},
-		gauges:    map[string]*fakeGauge{},
-		histogram: map[string]*fakeHistogram{},
+func (m *recordingMeter) Int64Gauge(name string, opts ...metric.Int64GaugeOption) (metric.Int64Gauge, error) {
+	m.record(name)
+	return m.Meter.Int64Gauge(name, opts...)
+}
+
+func (m *recordingMeter) Float64Gauge(name string, opts ...metric.Float64GaugeOption) (metric.Float64Gauge, error) {
+	m.record(name)
+	return m.Meter.Float64Gauge(name, opts...)
+}
+
+func (m *recordingMeter) Float64Histogram(name string, opts ...metric.Float64HistogramOption) (metric.Float64Histogram, error) {
+	m.record(name)
+	return m.Meter.Float64Histogram(name, opts...)
+}
+
+// ---- 采集与取值（Sum 取累计和、Gauge 取最新值）----
+
+func collectMetrics(t *testing.T, r *sdkmetric.ManualReader) metricdata.ResourceMetrics {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := r.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("采集指标: %v", err)
 	}
+	return rm
 }
 
-func (m *fakeMeter) NewCounter(name, _ string) observ.Counter {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.counters[name] = &fakeCounter{}
-	return m.counters[name]
-}
-
-func (m *fakeMeter) NewGauge(name, _ string) observ.Gauge {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.gauges[name] = &fakeGauge{}
-	return m.gauges[name]
-}
-
-func (m *fakeMeter) NewHistogram(name, _ string, _ []float64) observ.Histogram {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.histogram[name] = &fakeHistogram{}
-	return m.histogram[name]
-}
-
-func (m *fakeMeter) counter(name string) *fakeCounter {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.counters[name]
-}
-
-func (m *fakeMeter) gauge(name string) *fakeGauge {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.gauges[name]
-}
-
-func (m *fakeMeter) histogramValues(name string) []float64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if h := m.histogram[name]; h != nil {
-		return h.values()
+func findMetric(rm metricdata.ResourceMetrics, name string) (metricdata.Metrics, bool) {
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return m, true
+			}
+		}
 	}
-	return nil
+	return metricdata.Metrics{}, false
 }
+
+func sumOf(t *testing.T, rm metricdata.ResourceMetrics, name string) int64 {
+	t.Helper()
+	m, ok := findMetric(rm, name)
+	if !ok {
+		t.Fatalf("指标 %s 未采集到", name)
+	}
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("指标 %s 不是 Int64 Sum", name)
+	}
+	var total int64
+	for _, dp := range sum.DataPoints {
+		total += dp.Value
+	}
+	return total
+}
+
+func gaugeOf(t *testing.T, rm metricdata.ResourceMetrics, name string) float64 {
+	t.Helper()
+	m, ok := findMetric(rm, name)
+	if !ok {
+		t.Fatalf("指标 %s 未采集到", name)
+	}
+	g, ok := m.Data.(metricdata.Gauge[float64])
+	if !ok {
+		t.Fatalf("指标 %s 不是 Float64 Gauge", name)
+	}
+	if len(g.DataPoints) == 0 {
+		t.Fatalf("指标 %s 无数据点", name)
+	}
+	return g.DataPoints[len(g.DataPoints)-1].Value
+}
+
+func histogramOf(t *testing.T, rm metricdata.ResourceMetrics, name string) metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	m, ok := findMetric(rm, name)
+	if !ok {
+		t.Fatalf("指标 %s 未采集到", name)
+	}
+	h, ok := m.Data.(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("指标 %s 不是 Float64 Histogram", name)
+	}
+	if len(h.DataPoints) == 0 {
+		t.Fatalf("指标 %s 无数据点", name)
+	}
+	return h.DataPoints[0]
+}
+
+// ---- 日志测试替身：捕获全部记录的 slog.Handler（不做级别过滤）----
 
 type logEntry struct {
 	level slog.Level
@@ -132,30 +156,39 @@ func (e logEntry) attr(key string) (slog.Value, bool) {
 	return slog.Value{}, false
 }
 
-type fakeLogger struct {
+type recordHandler struct {
 	mu      sync.Mutex
 	entries []logEntry
 }
 
-func (l *fakeLogger) Enabled(slog.Level) bool { return true }
-func (l *fakeLogger) Log(level slog.Level, msg string, attrs ...slog.Attr) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.entries = append(l.entries, logEntry{level, msg, attrs})
+func (h *recordHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	e := logEntry{level: r.Level, msg: r.Message}
+	r.Attrs(func(a slog.Attr) bool { e.attrs = append(e.attrs, a); return true })
+	h.entries = append(h.entries, e)
+	return nil
 }
+func (h *recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordHandler) WithGroup(string) slog.Handler      { return h }
 
-func (l *fakeLogger) snapshot() []logEntry {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return append([]logEntry(nil), l.entries...)
+func (h *recordHandler) snapshot() []logEntry {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]logEntry(nil), h.entries...)
 }
 
 // ---- 指标命名 ----
 
 func TestMetricNames(t *testing.T) {
-	m := newFakeMeter()
+	m := newRecordingMeter(t)
 	if _, err := New(WithMeter(m)); err != nil {
 		t.Fatalf("New: %v", err)
+	}
+	created := map[string]bool{}
+	for _, name := range m.created() {
+		created[name] = true
 	}
 	for _, name := range []string{
 		"governor_pressure", "governor_suppression",
@@ -163,21 +196,25 @@ func TestMetricNames(t *testing.T) {
 		"governor_decisions_probe_total", "governor_batch_size",
 		"governor_wait_seconds", "governor_operations_seconds",
 	} {
-		if m.gauge(name) == nil && m.counter(name) == nil && m.histogramValues(name) == nil {
+		if !created[name] {
 			t.Errorf("缺少默认前缀指标 %s", name)
 		}
 	}
 }
 
 func TestMetricPrefix(t *testing.T) {
-	m := newFakeMeter()
+	m := newRecordingMeter(t)
 	if _, err := New(WithMeter(m), WithMetricPrefix("redis")); err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if m.gauge("redis_pressure") == nil {
+	created := map[string]bool{}
+	for _, name := range m.created() {
+		created[name] = true
+	}
+	if !created["redis_pressure"] {
 		t.Fatal("缺少自定义前缀指标 redis_pressure")
 	}
-	if m.gauge("governor_pressure") != nil {
+	if created["governor_pressure"] {
 		t.Fatal("不应再创建默认前缀指标")
 	}
 }
@@ -186,15 +223,15 @@ func TestMetricPrefix(t *testing.T) {
 
 func TestDecisionCounters(t *testing.T) {
 	t.Run("正常放行", func(t *testing.T) {
-		m := newFakeMeter()
+		m, r := newTestMeter(t)
 		g, _ := New(WithMeter(m), withRandSource(float64s(0.9, 0.9)))
 		g.Allow()
-		if got := m.counter("governor_decisions_allow_total").value(); got != 1 {
+		if got := sumOf(t, collectMetrics(t, r), "governor_decisions_allow_total"); got != 1 {
 			t.Fatalf("allow 计数 = %v, want 1", got)
 		}
 	})
 	t.Run("丢弃", func(t *testing.T) {
-		m := newFakeMeter()
+		m, r := newTestMeter(t)
 		clk := newFakeClock()
 		sig, _ := NewLatencySignal(WithLatencyTarget(time.Millisecond))
 		g, _ := New(WithMeter(m), WithClock(clk), WithSignals(sig), withRandSource(float64s(0, 0.5)))
@@ -202,12 +239,12 @@ func TestDecisionCounters(t *testing.T) {
 		clk.advance(time.Second)
 		dec.Record(nil) // 深度过载
 		g.Allow()       // r=0 < α, pd=0.5 ≥ ratio → 丢弃
-		if got := m.counter("governor_decisions_drop_total").value(); got != 1 {
+		if got := sumOf(t, collectMetrics(t, r), "governor_decisions_drop_total"); got != 1 {
 			t.Fatalf("drop 计数 = %v, want 1", got)
 		}
 	})
 	t.Run("探测放行", func(t *testing.T) {
-		m := newFakeMeter()
+		m, r := newTestMeter(t)
 		clk := newFakeClock()
 		sig, _ := NewLatencySignal(WithLatencyTarget(time.Millisecond))
 		g, _ := New(WithMeter(m), WithClock(clk), WithSignals(sig), withRandSource(float64s(0, 0)))
@@ -215,7 +252,7 @@ func TestDecisionCounters(t *testing.T) {
 		clk.advance(time.Second)
 		dec.Record(nil)
 		g.Allow() // r=0 < α, pd=0 < ratio → 探测
-		if got := m.counter("governor_decisions_probe_total").value(); got != 1 {
+		if got := sumOf(t, collectMetrics(t, r), "governor_decisions_probe_total"); got != 1 {
 			t.Fatalf("probe 计数 = %v, want 1", got)
 		}
 	})
@@ -224,7 +261,7 @@ func TestDecisionCounters(t *testing.T) {
 // ---- 状态仪表与耗时直方图 ----
 
 func TestStateGaugesAndHistogram(t *testing.T) {
-	m := newFakeMeter()
+	m, r := newTestMeter(t)
 	clk := newFakeClock()
 	sig, _ := NewLatencySignal(WithLatencyTarget(100*time.Millisecond), WithLatencyBeta(0.5))
 	g, _ := New(WithMeter(m), WithClock(clk), WithSignals(sig))
@@ -233,26 +270,27 @@ func TestStateGaugesAndHistogram(t *testing.T) {
 	clk.advance(150 * time.Millisecond)
 	dec.Record(nil)
 
-	if got := m.gauge("governor_pressure").value(); got != 0.5 {
+	rm := collectMetrics(t, r)
+	if got := gaugeOf(t, rm, "governor_pressure"); got != 0.5 {
 		t.Fatalf("压力仪表 = %v, want 0.5", got)
 	}
 	want := SuppressionFactor(0.5, 1)
-	if got := m.gauge("governor_suppression").value(); got != want {
+	if got := gaugeOf(t, rm, "governor_suppression"); got != want {
 		t.Fatalf("抑制仪表 = %v, want %v", got, want)
 	}
-	vals := m.histogramValues("governor_operations_seconds")
-	if len(vals) != 1 || vals[0] != 0.15 {
-		t.Fatalf("操作耗时直方图 = %v, want [0.15]", vals)
+	dp := histogramOf(t, rm, "governor_operations_seconds")
+	if dp.Count != 1 || dp.Sum != 0.15 {
+		t.Fatalf("操作耗时直方图 = count %d / sum %v, want 1 / 0.15", dp.Count, dp.Sum)
 	}
 }
 
 // ---- 日志跃迁（热路径不落日志，仅状态跃迁）----
 
 func TestLoggerTransitions(t *testing.T) {
-	lg := &fakeLogger{}
+	h := &recordHandler{}
 	clk := newFakeClock()
 	sig, _ := NewLatencySignal(WithLatencyTarget(100*time.Millisecond), WithLatencyBeta(0.5))
-	g, _ := New(WithLogger(lg), WithClock(clk), WithSignals(sig))
+	g, _ := New(WithLogger(slog.New(h)), WithClock(clk), WithSignals(sig))
 
 	// 1000ms 采样：S=9 → α≈0.9，上穿 0.5 → WARN
 	dec := g.Begin()
@@ -265,7 +303,7 @@ func TestLoggerTransitions(t *testing.T) {
 		d.Record(nil)
 	}
 
-	entries := lg.snapshot()
+	entries := h.snapshot()
 	if len(entries) != 2 {
 		t.Fatalf("日志条目 = %d, want 2: %+v", len(entries), entries)
 	}
@@ -279,7 +317,7 @@ func TestLoggerTransitions(t *testing.T) {
 	}
 }
 
-// ---- 缺省观测为 Noop ----
+// ---- 缺省观测为静默 ----
 
 func TestDefaultObservabilityIsNoop(t *testing.T) {
 	clk := newFakeClock()
@@ -299,10 +337,10 @@ func TestDefaultObservabilityIsNoop(t *testing.T) {
 // ---- 跃迁日志信号归因与深度抑制档位 ----
 
 func TestLoggerTransitionsDriverAndDeep(t *testing.T) {
-	lg := &fakeLogger{}
+	h := &recordHandler{}
 	clk := newFakeClock()
 	sig, _ := NewLatencySignal(WithLatencyTarget(100*time.Millisecond), WithLatencyBeta(0.5))
-	g, _ := New(WithLogger(lg), WithClock(clk), WithSignals(sig))
+	g, _ := New(WithLogger(slog.New(h)), WithClock(clk), WithSignals(sig))
 
 	// 1000ms 采样：S=9 → α=0.9，上穿 0.5 → WARN（started）
 	dec := g.Begin()
@@ -313,7 +351,7 @@ func TestLoggerTransitionsDriverAndDeep(t *testing.T) {
 	clk.advance(1100 * time.Millisecond)
 	dec.Record(nil)
 
-	entries := lg.snapshot()
+	entries := h.snapshot()
 	if len(entries) != 2 {
 		t.Fatalf("日志条目 = %d, want 2: %+v", len(entries), entries)
 	}

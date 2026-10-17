@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jninng/governor"
-	"github.com/jninng/observ"
 )
 
 func main() {
@@ -21,9 +20,10 @@ func main() {
 	// （INFO wait engaged / WARN suppression started /
 	// INFO suppression stopped / INFO wait released），
 	// DEBUG 级的 wait changed 明细静默——生产推荐的安静模式。
-	// 想看每次等待变化时把 Level 调为 slog.LevelDebug 即可。不设置时缺省为 Noop。
+	// 想看每次等待变化时把 Level 调为 slog.LevelDebug 即可。
+	// 不传 WithLogger 时缺省为静默（discard）；指标缺省跟随全局
+	// MeterProvider（未配置即 noop）。
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	observ.SetDefaultLogger(observ.NewSlogLogger(logger))
 
 	// 1) 感知：响应时长超过 500ms 视为压力
 	sig, err := governor.NewLatencySignal(governor.WithLatencyTarget(500 * time.Millisecond))
@@ -35,6 +35,7 @@ func main() {
 	g, err := governor.New(
 		governor.WithSignals(sig),
 		governor.WithBaseWait(2*time.Second),
+		governor.WithLogger(logger),
 	)
 	if err != nil {
 		panic(err)

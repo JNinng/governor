@@ -1,5 +1,5 @@
 // 真实 HTTP 演示：内置一个响应 250ms 的本地"过载服务"（目标 100ms），
-// 展示 http.Client 场景下的概率丢弃、业务降级与 observ 日志跃迁。
+// 展示 http.Client 场景下的概率丢弃、业务降级与 slog 日志跃迁。
 // 运行：go run ./example/http
 package main
 
@@ -16,16 +16,15 @@ import (
 	"time"
 
 	"github.com/jninng/governor"
-	"github.com/jninng/observ"
 )
 
 func main() {
 	// 以 Info 级别阈值接入 slog：只显示状态跃迁（WARN suppression started /
 	// INFO suppression stopped），DEBUG 级调整明细静默。
 	// http 路径不使用 Wait，无 wait engaged/released 跃迁。
-	// 不设置时缺省为 Noop，指标日志均零开销。
+	// 不传 WithLogger 时缺省为静默（discard），指标缺省跟随全局 MeterProvider
+	// （未配置即 noop），均零开销。
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	observ.SetDefaultLogger(observ.NewSlogLogger(logger))
 
 	// 内置"过载服务"：固定响应 250ms
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -47,7 +46,7 @@ func main() {
 	}
 	// 2) 流控器：接真实下游时，按目标各建一个实例；
 	//    需要指标时再传 WithMeter（见 README「埋点」）。
-	g, err := governor.New(governor.WithSignals(sig))
+	g, err := governor.New(governor.WithSignals(sig), governor.WithLogger(logger))
 	if err != nil {
 		log.Fatalf("创建流控器失败: %v", err)
 	}

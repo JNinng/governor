@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/jninng/observ"
 )
 
 // 执行层：把抑制因子翻译为三种控制动作（丢弃、批次、等待），
@@ -63,7 +62,7 @@ type Governor struct {
 	lastWait  time.Duration
 
 	metrics *metrics
-	logger  logger
+	logger  *slog.Logger
 }
 
 // New 创建 Governor。无信号时压力恒为 0（全部放行），仅作透传。
@@ -77,19 +76,19 @@ func New(opts ...Option) (*Governor, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	var ol observ.Logger = cfg.logger
-	if ol == nil {
-		ol = observ.DefaultLogger()
+	lg := cfg.logger
+	if lg == nil {
+		lg = discardLogger
 	}
 	m := cfg.meter
 	if m == nil {
-		m = observ.NoopMeter
+		m = defaultMeter()
 	}
 	g := &Governor{
 		signals: cfg.signals,
 		rnd:     rand.New(cfg.source),
 		metrics: newMetrics(m, cfg.prefix),
-		logger:  logger{l: ol},
+		logger:  lg,
 	}
 	g.cfg.Store(cfg)
 	return g, nil
@@ -115,13 +114,13 @@ func (g *Governor) Update(opts ...Option) error {
 		return err
 	}
 	g.cfg.Store(&cfg)
-	g.logger.info("governor: config updated",
-		slogAttrFloat("sensitivity_from", old.c), slogAttrFloat("sensitivity_to", cfg.c),
-		slogAttrFloat("probe_ratio_from", old.probeRatio), slogAttrFloat("probe_ratio_to", cfg.probeRatio),
-		slogAttrInt("batch_max_from", old.batchMax), slogAttrInt("batch_max_to", cfg.batchMax),
-		slogAttrInt("batch_min_from", old.batchMin), slogAttrInt("batch_min_to", cfg.batchMin),
-		slogAttrFloat("base_wait_seconds_from", seconds(old.baseWait)),
-		slogAttrFloat("base_wait_seconds_to", seconds(cfg.baseWait)))
+	g.logger.Info("governor: config updated",
+		slog.Float64("sensitivity_from", old.c), slog.Float64("sensitivity_to", cfg.c),
+		slog.Float64("probe_ratio_from", old.probeRatio), slog.Float64("probe_ratio_to", cfg.probeRatio),
+		slog.Int("batch_max_from", old.batchMax), slog.Int("batch_max_to", cfg.batchMax),
+		slog.Int("batch_min_from", old.batchMin), slog.Int("batch_min_to", cfg.batchMin),
+		slog.Float64("base_wait_seconds_from", seconds(old.baseWait)),
+		slog.Float64("base_wait_seconds_to", seconds(cfg.baseWait)))
 	return nil
 }
 
@@ -140,11 +139,11 @@ func (g *Governor) Allow() *Decision {
 	allowed, probe := decide(alpha, r, pd, cfg.probeRatio)
 	switch {
 	case probe:
-		g.metrics.probe.Inc()
+		g.metrics.probe.Add(context.Background(), 1)
 	case allowed:
-		g.metrics.allow.Inc()
+		g.metrics.allow.Add(context.Background(), 1)
 	default:
-		g.metrics.drop.Inc()
+		g.metrics.drop.Add(context.Background(), 1)
 	}
 	return g.newDecision(allowed, probe)
 }
@@ -165,7 +164,7 @@ func (g *Governor) Wait(ctx context.Context) *Decision {
 	from := g.lastWait
 	if changed {
 		g.lastWait = wait
-		g.metrics.waitSeconds.Set(seconds(wait))
+		g.metrics.waitSeconds.Record(ctx, seconds(wait))
 	}
 	// wait 跃迁检测：首次非零 engaged、归零 released；其余变化仍为 DEBUG
 	// 逐次明细，不进跃迁与回调。
@@ -185,12 +184,12 @@ func (g *Governor) Wait(ctx context.Context) *Decision {
 	}
 	g.mu.Unlock()
 	if changed {
-		g.logger.debug("governor: wait changed",
-			slogAttrFloat("from_seconds", seconds(from)),
-			slogAttrFloat("to_seconds", seconds(wait)))
+		g.logger.DebugContext(ctx, "governor: wait changed",
+			slog.Float64("from_seconds", seconds(from)),
+			slog.Float64("to_seconds", seconds(wait)))
 	}
 	if hasTr {
-		g.logWaitTransition(tr, alpha)
+		g.logWaitTransition(ctx, tr, alpha)
 		g.fireTransition(tr)
 	}
 	if ctx.Err() == nil {
@@ -208,13 +207,13 @@ func (g *Governor) BatchSize() int {
 	from := g.lastBatch
 	if changed {
 		g.lastBatch = n
-		g.metrics.batchSize.Set(float64(n))
+		g.metrics.batchSize.Record(context.Background(), int64(n))
 	}
 	g.mu.Unlock()
 	if changed {
-		g.logger.debug("governor: batch size changed",
-			slogAttrInt("from", from),
-			slogAttrInt("to", n))
+		g.logger.Debug("governor: batch size changed",
+			slog.Int("from", from),
+			slog.Int("to", n))
 	}
 	return n
 }
@@ -285,7 +284,7 @@ func (d *Decision) Record(err error) {
 	outcome := classifier(err)
 
 	if outcome != OutcomeIgnore {
-		d.g.metrics.opSeconds.Observe(seconds(took))
+		d.g.metrics.opSeconds.Record(context.Background(), seconds(took))
 	}
 
 	g := d.g
@@ -364,33 +363,33 @@ func (g *Governor) recomputeLocked(now time.Time) (Transition, bool) {
 	prev := g.alpha
 	g.alpha = a
 
-	g.metrics.pressure.Set(s)
-	g.metrics.suppression.Set(a)
+	g.metrics.pressure.Record(context.Background(), s)
+	g.metrics.suppression.Record(context.Background(), a)
 
 	driver, driverP := g.dominantLocked(now)
 	var kind TransitionKind
 	switch {
 	case prev <= 0.5 && a > 0.5:
 		kind = TransitionSuppressionStarted
-		g.logger.warn("governor: suppression started (alpha went above 0.5)",
-			slogAttrFloat("pressure", s),
-			slogAttrFloat("suppression", a),
-			slogAttrString("driver_signal", driver),
-			slogAttrFloat("driver_pressure", driverP))
+		g.logger.Warn("governor: suppression started (alpha went above 0.5)",
+			slog.Float64("pressure", s),
+			slog.Float64("suppression", a),
+			slog.String("driver_signal", driver),
+			slog.Float64("driver_pressure", driverP))
 	case prev <= 0.9 && a > 0.9:
 		kind = TransitionDeepSuppression
-		g.logger.warn("governor: deep suppression (alpha went above 0.9)",
-			slogAttrFloat("pressure", s),
-			slogAttrFloat("suppression", a),
-			slogAttrString("driver_signal", driver),
-			slogAttrFloat("driver_pressure", driverP))
+		g.logger.Warn("governor: deep suppression (alpha went above 0.9)",
+			slog.Float64("pressure", s),
+			slog.Float64("suppression", a),
+			slog.String("driver_signal", driver),
+			slog.Float64("driver_pressure", driverP))
 	case prev > 0 && a == 0:
 		kind = TransitionSuppressionStopped
-		g.logger.info("governor: suppression stopped (alpha reached 0)",
-			slogAttrFloat("pressure", s),
-			slogAttrFloat("suppression", a),
-			slogAttrString("driver_signal", driver),
-			slogAttrFloat("driver_pressure", driverP))
+		g.logger.Info("governor: suppression stopped (alpha reached 0)",
+			slog.Float64("pressure", s),
+			slog.Float64("suppression", a),
+			slog.String("driver_signal", driver),
+			slog.Float64("driver_pressure", driverP))
 	default:
 		return Transition{}, false
 	}
@@ -412,19 +411,19 @@ func (g *Governor) fireTransition(tr Transition) {
 
 // logWaitTransition 输出 wait 生效/解除跃迁日志——与 α 路径对称的低频 INFO，
 // 补齐延迟执行生效期在 Info 安静模式下的可见性（wait 逐次变化仍为 DEBUG）。
-func (g *Governor) logWaitTransition(tr Transition, alpha float64) {
+func (g *Governor) logWaitTransition(ctx context.Context, tr Transition, alpha float64) {
 	switch tr.Kind {
 	case TransitionWaitEngaged:
-		g.logger.info("governor: wait engaged (wait went above 0)",
-			slogAttrFloat("wait_seconds", tr.To),
-			slogAttrFloat("suppression", alpha),
-			slogAttrString("driver_signal", tr.Driver),
-			slogAttrFloat("driver_pressure", tr.DriverPressure))
+		g.logger.InfoContext(ctx, "governor: wait engaged (wait went above 0)",
+			slog.Float64("wait_seconds", tr.To),
+			slog.Float64("suppression", alpha),
+			slog.String("driver_signal", tr.Driver),
+			slog.Float64("driver_pressure", tr.DriverPressure))
 	case TransitionWaitReleased:
-		g.logger.info("governor: wait released (wait reached 0)",
-			slogAttrFloat("suppression", alpha),
-			slogAttrString("driver_signal", tr.Driver),
-			slogAttrFloat("driver_pressure", tr.DriverPressure))
+		g.logger.InfoContext(ctx, "governor: wait released (wait reached 0)",
+			slog.Float64("suppression", alpha),
+			slog.String("driver_signal", tr.Driver),
+			slog.Float64("driver_pressure", tr.DriverPressure))
 	}
 }
 

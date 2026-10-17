@@ -10,7 +10,7 @@ import (
 // 持锁（天然分片语义不变），仍可脱离 Group 单独构造与使用。
 //
 // 信号持有可变统计状态，不可跨 Governor 共享，故经信号工厂逐实例创建；
-// observ 无 label，按 key 生成的指标前缀是唯一合规的实例级隔离手段（ADR-0001）。
+// 指标无属性 label，按 key 生成的指标前缀是唯一合规的实例级隔离手段（ADR-0001）。
 type Group struct {
 	mu         sync.RWMutex
 	governors  map[string]*Governor
@@ -115,7 +115,7 @@ func WithSignalFactory(newSignals func() ([]Signal, error)) GroupOption {
 	}
 }
 
-// WithKeyPrefix 注入指标前缀函数。observ 无 label，前缀是唯一合规的实例级隔离
+// WithKeyPrefix 注入指标前缀函数。指标无属性 label，前缀是唯一合规的实例级隔离
 // 手段（ADR-0001）；nil 报错；不传时默认 "governor_<key>"（key 中除 [a-z0-9_]
 // 外的字符统一替换为下划线）。不同 key 规整后产生相同前缀时，后创建的 key 报错
 // （如 "user.service" 与 "user_service"），自定义前缀函数的输出同样参与检测。

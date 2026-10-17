@@ -52,31 +52,15 @@ func (s *stubSignal) Pressure(time.Time) float64                { return s.p }
 // closeEnough 用于等待秒数断言（Duration→float64 换算有舍入）。
 func closeEnough(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
 
-// capturingLogger 记录日志事件，验证跃迁日志的内容与级别。
+// capturingLogger 捕获日志记录，验证跃迁日志的内容与级别（slog.Handler 替身，
+// 捕获逻辑复用 recordHandler）。
 type capturingLogger struct {
-	mu      sync.Mutex
-	entries []capturedLog
-}
-
-type capturedLog struct {
-	level slog.Level
-	msg   string
-	attrs []slog.Attr
-}
-
-func (l *capturingLogger) Enabled(slog.Level) bool { return true }
-
-func (l *capturingLogger) Log(level slog.Level, msg string, attrs ...slog.Attr) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.entries = append(l.entries, capturedLog{level: level, msg: msg, attrs: attrs})
+	recordHandler
 }
 
 func (l *capturingLogger) count(msg string) int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	n := 0
-	for _, e := range l.entries {
+	for _, e := range l.snapshot() {
 		if e.msg == msg {
 			n++
 		}
@@ -85,16 +69,12 @@ func (l *capturingLogger) count(msg string) int {
 }
 
 func (l *capturingLogger) attrOf(msg, key string) (slog.Value, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, e := range l.entries {
+	for _, e := range l.snapshot() {
 		if e.msg != msg {
 			continue
 		}
-		for _, a := range e.attrs {
-			if a.Key == key {
-				return a.Value, true
-			}
+		if v, ok := e.attr(key); ok {
+			return v, true
 		}
 	}
 	return slog.Value{}, false
@@ -321,7 +301,7 @@ func TestWaitTransitionLogs(t *testing.T) {
 		t.Fatalf("NewLatencySignal: %v", err)
 	}
 	g, err := New(WithSignals(sig), WithClock(clk),
-		WithBaseWait(2*time.Second), WithLogger(cl))
+		WithBaseWait(2*time.Second), WithLogger(slog.New(cl)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

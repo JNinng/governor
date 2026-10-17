@@ -37,7 +37,8 @@
 //
 // # 埋点（ADR-0001）
 //
-// 直接依赖 observ 根模块：WithMeter 注入（默认 NoopMeter），
-// WithLogger 注入（缺省构造期快照 observ.DefaultLogger()）。
-// 指标无 label、枚举拆名，多实例用 WithMetricPrefix 区分。
+// 指标依赖 go.opentelemetry.io/otel/metric：WithMeter 注入 metric.Meter
+// （缺省取全局 MeterProvider——未配置即 noop 静默，首次 otel.SetMeterProvider
+// 后已建实例自动接入）；WithLogger 注入 *slog.Logger（缺省
+// discard，默认静默）。指标无属性 label、枚举拆名，多实例用 WithMetricPrefix 区分。
 package governor

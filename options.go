@@ -2,10 +2,11 @@ package governor
 
 import (
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"time"
 
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // 默认参数与 docs/desc.md 的建议一致（K=2、C=1、β=0.4、探测 2%、窗口 90s）。
@@ -28,8 +29,8 @@ type config struct {
 	baseWait   time.Duration
 	classifier Classifier
 	clock      Clock
-	meter      observ.Meter
-	logger     observ.Logger
+	meter      metric.Meter
+	logger     *slog.Logger
 	prefix     string
 	source     rand.Source
 	// structural 标记本配置经结构性 option 修改过（信号集合/分类器/时钟/
@@ -162,9 +163,9 @@ func WithClock(clk Clock) Option {
 	}
 }
 
-// WithMeter 注入指标 Meter（默认 observ.NoopMeter），不得为 nil。
-// 指标遵守 observ 无 label 约束：枚举拆名、耗时 _seconds（ADR-0001）。
-func WithMeter(m observ.Meter) Option {
+// WithMeter 注入指标 Meter（缺省取全局 MeterProvider，未配置即 noop
+// 静默），不得为 nil。指标无属性 label：枚举拆名、耗时 _seconds（ADR-0001）。
+func WithMeter(m metric.Meter) Option {
 	return func(c *config) error {
 		if m == nil {
 			return fmt.Errorf("governor: meter must not be nil")
@@ -175,8 +176,9 @@ func WithMeter(m observ.Meter) Option {
 	}
 }
 
-// WithLogger 注入日志 Logger（不得为 nil；缺省在构造期快照 observ.DefaultLogger()）。
-func WithLogger(l observ.Logger) Option {
+// WithLogger 注入日志 Logger（不得为 nil；缺省在构造期快照 discard logger，
+// 默认静默）。
+func WithLogger(l *slog.Logger) Option {
 	return func(c *config) error {
 		if l == nil {
 			return fmt.Errorf("governor: logger must not be nil")
@@ -188,7 +190,7 @@ func WithLogger(l observ.Logger) Option {
 }
 
 // WithMetricPrefix 设置指标名前缀（默认 "governor"），不得为空，用于多实例区分
-// （observ 无 label，前缀是唯一合规的实例级隔离手段）。
+// （指标无属性 label，前缀是唯一合规的实例级隔离手段）。
 func WithMetricPrefix(p string) Option {
 	return func(c *config) error {
 		c.prefix = p

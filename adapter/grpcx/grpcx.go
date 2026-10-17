@@ -51,7 +51,7 @@ import (
 	"sync"
 
 	"github.com/jninng/governor"
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -74,7 +74,7 @@ type Interceptor struct {
 	newSignals   func() ([]governor.Signal, error)
 	classify     func(err error) governor.Outcome
 	prefix       func(target string) string
-	meter        observ.Meter
+	meter        metric.Meter
 	sensitiv     *float64
 	probeRatio   *float64
 	onTransition func(target string, tr governor.Transition)
@@ -253,8 +253,8 @@ func WithProbeRatio(r float64) Option {
 	}
 }
 
-// WithMetricPrefix 注入指标前缀函数。observ 无 label，前缀是唯一合规的实例级隔离
-// 手段（ADR-0001）；nil 报错；不传时默认 "governor_<target>"（target 中除
+// WithMetricPrefix 注入指标前缀函数。指标无属性 label，前缀是唯一合规的实例级
+// 隔离手段（ADR-0001）；nil 报错；不传时默认 "governor_<target>"（target 中除
 // [a-z0-9_] 外的字符替换为下划线）。不同 target 规整后产生相同前缀时，后创建的
 // target 报错，自定义前缀函数的输出同样参与检测。
 func WithMetricPrefix(prefix func(target string) string) Option {
@@ -267,8 +267,9 @@ func WithMetricPrefix(prefix func(target string) string) Option {
 	}
 }
 
-// WithMeter 注入指标 Meter（不传为 observ.NoopMeter），不得为 nil。
-func WithMeter(m observ.Meter) Option {
+// WithMeter 注入指标 Meter（不传跟随 governor 缺省：取全局 MeterProvider，
+// 未配置即 noop 静默），不得为 nil。
+func WithMeter(m metric.Meter) Option {
 	return func(ix *Interceptor) error {
 		if m == nil {
 			return fmt.Errorf("governor/grpcx: meter must not be nil")

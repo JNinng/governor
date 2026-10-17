@@ -9,7 +9,7 @@ import (
 
 // 压测套件：量化高并发下 governor 各路径的开销，为"是否需要无锁化"提供数据。
 //
-// 覆盖三层分解：
+// 覆盖范围：
 //   - 决策纯函数（SuppressionFactor）——开销地板，锁/同步成本皆为相对它度量；
 //   - 信号组件（Latency/Rejection 的 Observe/Pressure）——组件级锁成本；
 //   - Governor 热路径（Allow/Do/Record/Wait/BatchSize）与读路径（Pressure/Signals）；

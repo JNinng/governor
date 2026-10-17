@@ -1,8 +1,8 @@
 // Package grpcx 提供 gRPC client 的传输层适配器：Unary / Stream client interceptor，
 // 按 ClientConn target 自动创建并复用 Governor，自动完成决策与反馈（成败 + 耗时）。
 //
-// 本包是独立 Go module（不随核心库依赖 grpc-go）：核心库保持零第三方依赖
-// （ADR-0001 同款考量），仅使用本适配器的用户自行引入 google.golang.org/grpc。
+// 本包是独立 Go module：核心库不引入 grpc-go（埋点侧仅依赖 otel 指标 API
+// 与 slog），仅使用本适配器的用户自行引入 google.golang.org/grpc。
 //
 // 语义（纯包装层，不改 Allow 契约）：
 //   - 命中抑制时 RPC 直接返回 governor.ErrSuppressed（未发往远端），

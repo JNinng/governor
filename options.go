@@ -176,8 +176,7 @@ func WithMeter(m metric.Meter) Option {
 	}
 }
 
-// WithLogger 注入日志 Logger（不得为 nil；缺省在构造期快照 discard logger，
-// 默认静默）。
+// WithLogger 注入日志 Logger（不得为 nil；缺省 discard logger，默认静默）。
 func WithLogger(l *slog.Logger) Option {
 	return func(c *config) error {
 		if l == nil {

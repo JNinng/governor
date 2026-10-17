@@ -12,7 +12,7 @@ import (
 // MeterProvider（未配置即 noop 静默）；日志用 log/slog，缺省 discard 静默。
 // 热路径只打指标，日志仅低频状态跃迁；指标无属性 label，枚举拆名、耗时一律 _seconds。
 
-// metrics 持有构造期创建的全部指标（otel 仪表绑定创建时刻的 provider）。
+// metrics 持有构造期创建的全部指标（otel 规范：仪表仅构造期创建、记录时复用）。
 type metrics struct {
 	pressure    metric.Float64Gauge
 	suppression metric.Float64Gauge
@@ -28,8 +28,8 @@ type metrics struct {
 var defaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 func newMetrics(m metric.Meter, prefix string) *metrics {
-	// otel 仪表创建失败时仍返回可用（noop）实现，错误仅表明当前 provider
-	// 不支持该仪表，不打断构造。
+	// otel SDK 与全局默认 provider 在创建报错时仍返回可用仪表（典型原因是
+	// 名称不合规，如前缀不以字母开头），故忽略错误、不打断构造。
 	pressure, _ := m.Float64Gauge(prefix+"_pressure",
 		metric.WithDescription("Current pressure index S (worst signal wins)"), metric.WithUnit("1"))
 	suppression, _ := m.Float64Gauge(prefix+"_suppression",
